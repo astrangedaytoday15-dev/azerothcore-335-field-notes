@@ -1,0 +1,1169 @@
+diff --git a/conf/playerbots.conf.dist b/conf/playerbots.conf.dist
+index 8c20d269..2bd7faad 100644
+--- a/conf/playerbots.conf.dist
++++ b/conf/playerbots.conf.dist
+@@ -2690,6 +2690,100 @@ AiPlayerbot.AllowedLogFiles = ""
+ #
+ ####################################################################################################
+ 
++####################################################################################################
++# GUILD BANK EXCHANGE
++#
++# Bots in a guild now and then swap ONE random bag item with one slot of a guild bank tab:
++# an empty slot is a plain deposit, an occupied slot gives the bot that item in return.
++# No vault trip; the core does every rights / log / DB step (rank deposit + withdraw rights apply).
++# Eligible: trade goods, or armor / weapons from MinQuality to MaxQuality; never soulbound,
++# quest, conjured or limited-duration items, never equipped / bank / keyring items.
++#
++
++# Enable the exchange
++# Default: 0 (disabled)
++AiPlayerbot.GuildBank.Enabled = 0
++
++# Per-bot timer in seconds (random between Min and Max), then a Chance roll in %
++# Default: 3600, 7200, 50
++AiPlayerbot.GuildBank.MinInterval = 3600
++AiPlayerbot.GuildBank.MaxInterval = 7200
++AiPlayerbot.GuildBank.Chance = 50
++
++# Bank tab used (0 = first tab; the guild must have bought it)
++# Default: 0
++AiPlayerbot.GuildBank.Tab = 0
++
++# Item filters: quality range for armor / weapons (2 = green, 4 = epic), trade goods on / off
++# Default: 2, 4, 1, 1
++AiPlayerbot.GuildBank.MinQuality = 2
++AiPlayerbot.GuildBank.MaxQuality = 4
++AiPlayerbot.GuildBank.TradeGoods = 1
++AiPlayerbot.GuildBank.ArmorWeapons = 1
++
++# Chance in % to use the first free slot instead of a random slot (a random occupied slot is a swap)
++# Default: 50
++AiPlayerbot.GuildBank.PreferEmptyChance = 50
++
++# Chance in % for one guild chat line per exchange (texts guild_bank_deposit / guild_bank_swap)
++# Default: 30
++AiPlayerbot.GuildBank.ChatChance = 30
++
++# "gb <item>" works without a nearby guild vault (the deposit runs on the world thread)
++# Default: 0
++AiPlayerbot.GuildBank.RemoteCommand = 0
++
++# Also non-random bots (altbots)
++# Default: 0
++AiPlayerbot.GuildBank.AltBots = 0
++
++# Prefer armor / weapons the bot cannot use (wrong class / armor type / level)
++# Default: 0
++AiPlayerbot.GuildBank.SmartGive = 0
++
++# Chance in % per swap to aim at a bank item the bot would wear (an equip / replace upgrade for its spec);
++# otherwise the slot is picked as above. A bot that asked for an upgrade (WantChance) always aims.
++# Default: 0
++AiPlayerbot.GuildBank.SmartTakeChance = 0
++
++# Run the bot's normal auto-equip right after it took an upgrade (same choice logic, no forced equip)
++# Default: 0
++AiPlayerbot.GuildBank.EquipAfterTake = 0
++
++# Per-member totals (items in / out, gold in / out / repairs) in table playerbots_guild_ledger;
++# whisper a guild bot "ledger" to see the top 5
++# Default: 0
++AiPlayerbot.GuildBank.Ledger = 0
++
++# "need <item link>" in guild chat: after NeedDelayMin-NeedDelayMax s an online guild bot that carries
++# the item in its bags deposits it into a free slot. NeedUsable 0 = bots keep items they would wear.
++# Default: 0, 60, 600, 1
++AiPlayerbot.GuildBank.NeedRequests = 0
++AiPlayerbot.GuildBank.NeedDelayMin = 60
++AiPlayerbot.GuildBank.NeedDelayMax = 600
++AiPlayerbot.GuildBank.NeedUsable = 1
++
++# Chance in % per timer hit that a bot asks guild chat for an upgrade of its weakest piece, checks the
++# bank again within 10-20 min (for up to 1 h) and thanks the member who deposited what it takes
++# Default: 0
++AiPlayerbot.GuildBank.WantChance = 0
++
++# % of looted gold a bot deposits into the guild bank on its timer
++# Default: 0
++AiPlayerbot.GuildBank.GoldSharePct = 0
++
++# Bots repair from the guild bank first (rank repair rights and daily limit apply), own gold for the rest
++# Default: 0
++AiPlayerbot.GuildBank.GuildRepair = 0
++
++# When the tab is full, a bot takes one grey item out (it sells it on its next vendor visit)
++# Default: 0
++AiPlayerbot.GuildBank.CleanupGreys = 0
++
++#
++#
++####################################################################################################
++
+ ##############################################
+ # Deprecated Settings (yet still in use)     #
+ ##############################################
+diff --git a/data/sql/playerbots/updates/2026_10_18_00_playerbots_guild_bank_exchange.sql b/data/sql/playerbots/updates/2026_10_18_00_playerbots_guild_bank_exchange.sql
+new file mode 100644
+index 00000000..f303a6a4
+--- /dev/null
++++ b/data/sql/playerbots/updates/2026_10_18_00_playerbots_guild_bank_exchange.sql
+@@ -0,0 +1,28 @@
++-- #########################################################
++-- Playerbots - Guild Bank Exchange: member ledger + chat texts
++-- #########################################################
++
++CREATE TABLE IF NOT EXISTS `playerbots_guild_ledger` (
++  `guildid` INT UNSIGNED NOT NULL,
++  `guid` INT UNSIGNED NOT NULL COMMENT 'character guid',
++  `items_in` INT UNSIGNED NOT NULL DEFAULT 0,
++  `items_out` INT UNSIGNED NOT NULL DEFAULT 0,
++  `gold_in` BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'copper',
++  `gold_out` BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'copper',
++  `repair_out` BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'copper',
++  PRIMARY KEY (`guildid`, `guid`)
++) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
++
++DELETE FROM `ai_playerbot_texts` WHERE `name` IN ('guild_bank_deposit', 'guild_bank_swap', 'guild_bank_need', 'guild_bank_want', 'guild_bank_thanks');
++
++INSERT INTO `ai_playerbot_texts` (`name`, `text`, `say_type`, `reply_type`, `text_loc1`, `text_loc2`, `text_loc3`, `text_loc4`, `text_loc5`, `text_loc6`, `text_loc7`, `text_loc8`) VALUES
++('guild_bank_deposit', 'Dropped off %item in the guild bank.', 0, 0, '', '', '', '', '', '', '', ''),
++('guild_bank_deposit', 'Left %item in the guild bank if anyone wants it.', 0, 0, '', '', '', '', '', '', '', ''),
++('guild_bank_swap', 'Swapped %item for %other in the guild bank, thanks!', 0, 0, '', '', '', '', '', '', '', ''),
++('guild_bank_swap', 'Traded %item for %other at the guild bank.', 0, 0, '', '', '', '', '', '', '', ''),
++('guild_bank_need', 'Put %item in the guild bank for %name.', 0, 0, '', '', '', '', '', '', '', ''),
++('guild_bank_need', '%name, I had a spare %item, it is in the guild bank now.', 0, 0, '', '', '', '', '', '', '', ''),
++('guild_bank_want', 'Anyone have a better %slot for a level %level %class? I''ll check the guild bank.', 0, 0, '', '', '', '', '', '', '', ''),
++('guild_bank_want', 'Still looking for a %slot upgrade (level %level %class), guild bank works.', 0, 0, '', '', '', '', '', '', '', ''),
++('guild_bank_thanks', 'Thanks for the %item, %name!', 0, 0, '', '', '', '', '', '', '', ''),
++('guild_bank_thanks', 'Got the %item from the bank, much appreciated %name.', 0, 0, '', '', '', '', '', '', '', '');
+diff --git a/src/Ai/Base/Actions/GuildBankAction.cpp b/src/Ai/Base/Actions/GuildBankAction.cpp
+index e97466ae..e9e756b5 100644
+--- a/src/Ai/Base/Actions/GuildBankAction.cpp
++++ b/src/Ai/Base/Actions/GuildBankAction.cpp
+@@ -6,8 +6,10 @@
+ 
+ #include "GuildBankAction.h"
+ #include "AiObjectContext.h"
++#include "GuildBankExchangeMgr.h"
+ #include "GuildMgr.h"
+ #include "PlayerbotAI.h"
++#include "PlayerbotWorldThreadProcessor.h"
+ 
+ bool GuildBankAction::Execute(Event event)
+ {
+@@ -21,6 +23,22 @@ bool GuildBankAction::Execute(Event event)
+         return false;
+     }
+ 
++    // GuildBank.RemoteCommand: no vault needed; the deposit runs on the world thread
++    if (sGuildBankExchangeMgr.GetConfig().remoteCommand)
++    {
++        std::vector<Item*> found = parseItems(text);
++        if (found.empty())
++            return false;
++
++        for (Item* item : found)
++        {
++            if (item)
++                PlayerbotWorldThreadProcessor::instance().QueueOperation(
++                    std::make_unique<GuildBankDepositOperation>(bot->GetGUID(), item->GetGUID()));
++        }
++        return true;
++    }
++
+     GuidVector gos = *botAI->GetAiObjectContext()->GetValue<GuidVector>("nearest game objects");
+     for (GuidVector::iterator i = gos.begin(); i != gos.end(); ++i)
+     {
+diff --git a/src/Ai/Base/Actions/RepairAllAction.cpp b/src/Ai/Base/Actions/RepairAllAction.cpp
+index 237b87e0..2a1f498a 100644
+--- a/src/Ai/Base/Actions/RepairAllAction.cpp
++++ b/src/Ai/Base/Actions/RepairAllAction.cpp
+@@ -7,6 +7,7 @@
+ #include "RepairAllAction.h"
+ #include "ChatHelper.h"
+ #include "Event.h"
++#include "GuildBankExchangeMgr.h"
+ #include "Playerbots.h"
+ 
+ bool RepairAllAction::Execute(Event /*event*/)
+@@ -25,6 +26,13 @@ bool RepairAllAction::Execute(Event /*event*/)
+         float discountMod = bot->GetReputationPriceDiscount(unit);
+ 
+         uint32 botMoney = bot->GetMoney();
++
++        // Guild bank repairs first (rank repair rights + daily limit are core rules); own gold for the rest
++        uint32 guildCost = 0;
++        if (sGuildBankExchangeMgr.GetConfig().enabled && sGuildBankExchangeMgr.GetConfig().guildRepair &&
++            bot->GetGuildId() && !botAI->HasCheat(BotCheatMask::gold))
++            guildCost = bot->DurabilityRepairAll(true, discountMod, true);
++
+         if (botAI->HasCheat(BotCheatMask::gold))
+         {
+             bot->SetMoney(10000000);
+@@ -42,6 +50,7 @@ bool RepairAllAction::Execute(Event /*event*/)
+             bot->SetMoney(botMoney);
+         }
+ 
++        totalCost += guildCost;
+         if (totalCost > 0)
+         {
+             std::ostringstream out;
+diff --git a/src/Mgr/Guild/GuildBankExchangeMgr.cpp b/src/Mgr/Guild/GuildBankExchangeMgr.cpp
+new file mode 100644
+index 00000000..188141d4
+--- /dev/null
++++ b/src/Mgr/Guild/GuildBankExchangeMgr.cpp
+@@ -0,0 +1,764 @@
++/*
++ * This file is part of the mod-playerbots module for AzerothCore. See AUTHORS file for Copyright
++ * information; released under GNU GPL v2 license, redistribute/modify under version 2 of the License,
++ * or (at your option) any later version.
++ */
++
++#include "GuildBankExchangeMgr.h"
++#include "AiObjectContext.h"
++#include "Bag.h"
++#include "CharacterCache.h"
++#include "ChatHelper.h"
++#include "Config.h"
++#include "DatabaseEnv.h"
++#include "GameTime.h"
++#include "Guild.h"
++#include "GuildMgr.h"
++#include "GuildScript.h"
++#include "Item.h"
++#include "ItemUsageValue.h"
++#include "Log.h"
++#include "LootMgr.h"
++#include "ObjectAccessor.h"
++#include "ObjectMgr.h"
++#include "Player.h"
++#include "PlayerScript.h"
++#include "PlayerbotAI.h"
++#include "PlayerbotTextMgr.h"
++#include "PlayerbotsDatabase.h"
++#include "Playerbots.h"
++#include "Random.h"
++#include "RandomPlayerbotMgr.h"
++#include "ScriptMgr.h"
++#include "WorldSession.h"
++#include <algorithm>
++#include <iterator>
++#include <sstream>
++#include <vector>
++
++void GuildBankExchangeMgr::LoadConfig()
++{
++    config.enabled = sConfigMgr->GetOption<bool>("AiPlayerbot.GuildBank.Enabled", false);
++    config.minInterval = sConfigMgr->GetOption<uint32>("AiPlayerbot.GuildBank.MinInterval", 3600);
++    config.maxInterval = sConfigMgr->GetOption<uint32>("AiPlayerbot.GuildBank.MaxInterval", 7200);
++    config.chance = sConfigMgr->GetOption<uint32>("AiPlayerbot.GuildBank.Chance", 50);
++    config.tab = sConfigMgr->GetOption<uint32>("AiPlayerbot.GuildBank.Tab", 0);
++    config.minQuality = sConfigMgr->GetOption<uint32>("AiPlayerbot.GuildBank.MinQuality", 2);
++    config.maxQuality = sConfigMgr->GetOption<uint32>("AiPlayerbot.GuildBank.MaxQuality", 4);
++    config.tradeGoods = sConfigMgr->GetOption<bool>("AiPlayerbot.GuildBank.TradeGoods", true);
++    config.armorWeapons = sConfigMgr->GetOption<bool>("AiPlayerbot.GuildBank.ArmorWeapons", true);
++    config.preferEmptyChance = sConfigMgr->GetOption<uint32>("AiPlayerbot.GuildBank.PreferEmptyChance", 50);
++    config.chatChance = sConfigMgr->GetOption<uint32>("AiPlayerbot.GuildBank.ChatChance", 30);
++    config.remoteCommand = sConfigMgr->GetOption<bool>("AiPlayerbot.GuildBank.RemoteCommand", false);
++    config.altBots = sConfigMgr->GetOption<bool>("AiPlayerbot.GuildBank.AltBots", false);
++    config.smartGive = sConfigMgr->GetOption<bool>("AiPlayerbot.GuildBank.SmartGive", false);
++    config.smartTakeChance = std::min<uint32>(sConfigMgr->GetOption<uint32>("AiPlayerbot.GuildBank.SmartTakeChance", 0), 100);
++    config.equipAfterTake = sConfigMgr->GetOption<bool>("AiPlayerbot.GuildBank.EquipAfterTake", false);
++    config.ledger = sConfigMgr->GetOption<bool>("AiPlayerbot.GuildBank.Ledger", false);
++    config.needRequests = sConfigMgr->GetOption<bool>("AiPlayerbot.GuildBank.NeedRequests", false);
++    config.needDelayMin = sConfigMgr->GetOption<uint32>("AiPlayerbot.GuildBank.NeedDelayMin", 60);
++    config.needDelayMax = sConfigMgr->GetOption<uint32>("AiPlayerbot.GuildBank.NeedDelayMax", 600);
++    config.needUsable = sConfigMgr->GetOption<bool>("AiPlayerbot.GuildBank.NeedUsable", true);
++    config.wantChance = std::min<uint32>(sConfigMgr->GetOption<uint32>("AiPlayerbot.GuildBank.WantChance", 0), 100);
++    config.goldSharePct = std::min<uint32>(sConfigMgr->GetOption<uint32>("AiPlayerbot.GuildBank.GoldSharePct", 0), 100);
++    config.guildRepair = sConfigMgr->GetOption<bool>("AiPlayerbot.GuildBank.GuildRepair", false);
++    config.cleanupGreys = sConfigMgr->GetOption<bool>("AiPlayerbot.GuildBank.CleanupGreys", false);
++
++    if (config.maxInterval < config.minInterval)
++        config.maxInterval = config.minInterval;
++    if (config.tab >= GUILD_BANK_MAX_TABS)
++        config.tab = 0;
++    if (config.needDelayMax < config.needDelayMin)
++        config.needDelayMax = config.needDelayMin;
++
++    // new intervals apply to every bot from the next check
++    nextExchange.clear();
++    wanting.clear();
++
++    if (config.enabled)
++        LOG_INFO("server.loading", "Playerbots guild bank exchange enabled (tab {}, every {}-{} s, chance {}%)",
++                 config.tab, config.minInterval, config.maxInterval, config.chance);
++}
++
++void GuildBankExchangeMgr::Update(uint32 diff)
++{
++    if (!config.enabled)
++        return;
++
++    checkTimer += diff;
++    if (checkTimer < 10 * IN_MILLISECONDS)
++        return;
++    checkTimer = 0;
++
++    uint32 now = uint32(GameTime::GetGameTime().count());
++    ProcessNeeds(now);
++
++    for (auto const& [guid, player] : ObjectAccessor::GetPlayers())
++    {
++        if (!player || !player->IsInWorld() || !player->GetSession() || !IsGuildBot(player))
++            continue;
++
++        // first sight of a bot: start its timer
++        auto [itr, inserted] = nextExchange.try_emplace(player->GetGUID().GetCounter(), 0);
++        if (inserted || !itr->second)
++        {
++            itr->second = now + urand(config.minInterval, config.maxInterval);
++            continue;
++        }
++
++        if (now < itr->second)
++            continue;
++
++        itr->second = now + urand(config.minInterval, config.maxInterval);
++
++        if (!player->IsAlive() || player->IsInCombat() || player->IsBeingTeleported())
++            continue;
++
++        Guild* guild = sGuildMgr->GetGuildById(player->GetGuildId());
++        if (!guild)
++            continue;
++
++        ShareGold(player, guild);
++
++        // a bot that asked for an upgrade always looks at the bank on its (shortened) timer
++        ObjectGuid::LowType botGuid = player->GetGUID().GetCounter();
++        auto want = wanting.find(botGuid);
++        bool asked = want != wanting.end() && now < want->second;
++        if (want != wanting.end() && !asked)
++            wanting.erase(want);
++
++        if (asked || urand(1, 100) <= config.chance)
++            Exchange(player);
++
++        if (config.wantChance && !wanting.count(botGuid) && urand(1, 100) <= config.wantChance && AskForUpgrade(player))
++        {
++            wanting[botGuid] = now + HOUR;
++            itr->second = now + urand(10 * MINUTE, 20 * MINUTE);
++        }
++    }
++}
++
++bool GuildBankExchangeMgr::IsGuildBot(Player* player) const
++{
++    if (!player || !player->GetGuildId())
++        return false;
++
++    PlayerbotAI* botAI = GET_PLAYERBOT_AI(player);
++    if (!botAI || IsSelfBot(player))
++        return false;
++
++    return config.altBots || sRandomPlayerbotMgr.IsRandomBot(player);
++}
++
++bool GuildBankExchangeMgr::IsEligible(Player* /*bot*/, Item* item) const
++{
++    ItemTemplate const* proto = item->GetTemplate();
++    if (!proto)
++        return false;
++
++    if (item->IsSoulBound() || !item->CanBeTraded() || item->IsNotEmptyBag() || item->IsConjuredConsumable())
++        return false;
++
++    if (proto->Class == ITEM_CLASS_QUEST || proto->StartQuest || proto->Bonding == BIND_QUEST_ITEM ||
++        proto->Bonding == BIND_QUEST_ITEM1 || proto->Duration > 0)
++        return false;
++
++    if (proto->Class == ITEM_CLASS_TRADE_GOODS)
++        return config.tradeGoods;
++
++    if (proto->Class == ITEM_CLASS_ARMOR || proto->Class == ITEM_CLASS_WEAPON)
++        return config.armorWeapons && proto->Quality >= config.minQuality && proto->Quality <= config.maxQuality;
++
++    return false;
++}
++
++Item* GuildBankExchangeMgr::PickItem(Player* bot) const
++{
++    std::vector<Item*> items;
++    std::vector<Item*> unusable;
++    auto consider = [&](Item* item)
++    {
++        if (!item || !IsEligible(bot, item))
++            return;
++
++        items.push_back(item);
++        ItemTemplate const* proto = item->GetTemplate();
++        if (config.smartGive && (proto->Class == ITEM_CLASS_ARMOR || proto->Class == ITEM_CLASS_WEAPON) &&
++            bot->CanUseItem(proto) != EQUIP_ERR_OK)
++            unusable.push_back(item);
++    };
++
++    // bags only: backpack + equipped bags (never equipped items, bank or keyring)
++    for (uint8 slot = INVENTORY_SLOT_ITEM_START; slot < INVENTORY_SLOT_ITEM_END; ++slot)
++        consider(bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot));
++
++    for (uint8 bag = INVENTORY_SLOT_BAG_START; bag < INVENTORY_SLOT_BAG_END; ++bag)
++    {
++        if (Bag* pBag = bot->GetBagByPos(bag))
++        {
++            for (uint32 slot = 0; slot < pBag->GetBagSize(); ++slot)
++                consider(pBag->GetItemByPos(uint8(slot)));
++        }
++    }
++
++    std::vector<Item*> const& pool = unusable.empty() ? items : unusable;
++    if (pool.empty())
++        return nullptr;
++
++    return pool[urand(0, pool.size() - 1)];
++}
++
++std::vector<GuildBankSlotItem> GuildBankExchangeMgr::ReadTab(uint32 guildId, uint8 tab) const
++{
++    // the core keeps bank tabs private; guild_bank_item is written on every move
++    std::vector<GuildBankSlotItem> slots;
++    QueryResult result = CharacterDatabase.Query(
++        "SELECT b.SlotId, i.itemEntry, i.randomPropertyId FROM guild_bank_item b JOIN item_instance i ON i.guid = "
++        "b.item_guid WHERE b.guildid = {} AND b.TabId = {}",
++        guildId, tab);
++    if (!result)
++        return slots;
++
++    do
++    {
++        Field* fields = result->Fetch();
++        slots.push_back({fields[0].Get<uint8>(), fields[1].Get<uint32>(), int32(fields[2].Get<int16>())});
++    } while (result->NextRow());
++
++    return slots;
++}
++
++bool GuildBankExchangeMgr::IsUpgrade(Player* bot, uint32 entry, int32 randomPropertyId) const
++{
++    PlayerbotAI* botAI = GET_PLAYERBOT_AI(bot);
++    if (!botAI)
++        return false;
++
++    // the value the stock auto-equip uses (EquipAction::SelectInventoryItemsToEquip), but only a real
++    // upgrade for the bot's spec: EQUIP / REPLACE, never BAD_EQUIP
++    std::string param = std::to_string(entry);
++    if (randomPropertyId != 0)
++        param += "," + std::to_string(randomPropertyId);
++
++    ItemUsage usage = botAI->GetAiObjectContext()->GetValue<ItemUsage>("item upgrade", param)->Get();
++    return usage == ITEM_USAGE_EQUIP || usage == ITEM_USAGE_REPLACE;
++}
++
++int32 GuildBankExchangeMgr::PickUpgradeSlot(Player* bot, std::vector<GuildBankSlotItem> const& slots) const
++{
++    std::vector<uint8> upgrades;
++    for (GuildBankSlotItem const& slot : slots)
++    {
++        ItemTemplate const* proto = sObjectMgr->GetItemTemplate(slot.entry);
++        if (!proto || (proto->Class != ITEM_CLASS_ARMOR && proto->Class != ITEM_CLASS_WEAPON))
++            continue;
++
++        if (IsUpgrade(bot, slot.entry, slot.randomPropertyId))
++            upgrades.push_back(slot.slot);
++    }
++
++    if (upgrades.empty())
++        return -1;
++
++    return upgrades[urand(0, upgrades.size() - 1)];
++}
++
++bool GuildBankExchangeMgr::Exchange(Player* bot)
++{
++    Guild* guild = sGuildMgr->GetGuildById(bot->GetGuildId());
++    if (!guild)
++        return false;
++
++    uint8 tab = uint8(config.tab);
++    if (!guild->MemberHasTabRights(bot->GetGUID(), tab, GUILD_BANK_RIGHT_DEPOSIT_ITEM))
++        return false;
++
++    Item* item = PickItem(bot);
++    if (!item)
++        return false;
++
++    // the item may be moved or deleted (stack merge) by the core: keep only copies
++    ObjectGuid itemGuid = item->GetGUID();
++    uint32 givenEntry = item->GetEntry();
++    uint8 bag = item->GetBagSlot();
++    uint8 slot = item->GetSlot();
++
++    // SmartTake: aim at a bank item the bot would wear (always for a bot that asked for one)
++    ObjectGuid::LowType botGuid = bot->GetGUID().GetCounter();
++    bool asked = wanting.count(botGuid) > 0;
++    int32 target = -1;
++    if (asked || (config.smartTakeChance && urand(1, 100) <= config.smartTakeChance))
++        target = PickUpgradeSlot(bot, ReadTab(guild->GetId(), tab));
++
++    // else the first free slot, or a random slot (empty = deposit, occupied = swap)
++    bool freeSlot = target < 0 && urand(1, 100) <= config.preferEmptyChance;
++    uint8 bankSlot = target >= 0 ? uint8(target) : (freeSlot ? uint8(NULL_SLOT) : uint8(urand(0, GUILD_BANK_MAX_SLOTS - 1)));
++    guild->SwapItemsWithInventory(bot, false, tab, bankSlot, bag, slot, 0);
++
++    Item* after = bot->GetItemByPos(bag, slot);
++    if (after && after->GetGUID() == itemGuid)
++    {
++        // nothing moved (no tab, no withdraw left for a swap, tab full, ...): one retry into a free slot
++        if (!freeSlot)
++        {
++            guild->SwapItemsWithInventory(bot, false, tab, NULL_SLOT, bag, slot, 0);
++            after = bot->GetItemByPos(bag, slot);
++        }
++
++        if (after && after->GetGUID() == itemGuid)
++        {
++            if (config.cleanupGreys)
++                TakeGrey(bot, guild);
++            return false;
++        }
++    }
++
++    // an item in that bag slot now = the bank item the bot took in return
++    uint32 takenEntry = after ? after->GetEntry() : 0;
++    bool equipped = false;
++    if (after && takenEntry && IsUpgrade(bot, takenEntry, after->GetItemRandomPropertyId()))
++    {
++        ObjectGuid takenGuid = after->GetGUID();
++        if (config.equipAfterTake)
++        {
++            // the stock auto-equip, run now instead of on its random trigger: same choice logic
++            if (PlayerbotAI* botAI = GET_PLAYERBOT_AI(bot))
++                botAI->DoSpecificAction("equip upgrades packet action", Event(), true);
++
++            Item* taken = bot->GetItemByGuid(takenGuid);
++            equipped = taken && taken->IsEquipped();
++        }
++
++        if (asked)
++        {
++            wanting.erase(botGuid);
++            ThankDepositor(bot, takenEntry);
++        }
++    }
++
++    LOG_INFO("playerbots", "Guild bank exchange: {} gave {} took {} equipped={} smart={} (guild {}, tab {})",
++             bot->GetName(), givenEntry, takenEntry, equipped ? 1 : 0, target >= 0 ? 1 : 0, guild->GetId(), tab);
++    Announce(bot, givenEntry, takenEntry);
++    return true;
++}
++
++bool GuildBankExchangeMgr::TakeGrey(Player* bot, Guild* guild)
++{
++    uint8 tab = uint8(config.tab);
++    for (GuildBankSlotItem const& slot : ReadTab(guild->GetId(), tab))
++    {
++        ItemTemplate const* proto = sObjectMgr->GetItemTemplate(slot.entry);
++        if (!proto || proto->Quality != ITEM_QUALITY_POOR)
++            continue;
++
++        // to the bags (first free spot); the bot sells it on its next vendor visit
++        uint32 before = bot->GetItemCount(slot.entry);
++        guild->SwapItemsWithInventory(bot, true, tab, slot.slot, NULL_BAG, NULL_SLOT, 0);
++        bool taken = bot->GetItemCount(slot.entry) > before;
++        if (taken)
++            LOG_INFO("playerbots", "Guild bank exchange: {} took grey {} out of a full tab (guild {}, tab {})",
++                     bot->GetName(), slot.entry, guild->GetId(), tab);
++        return taken;
++    }
++
++    return false;
++}
++
++void GuildBankExchangeMgr::ShareGold(Player* bot, Guild* guild)
++{
++    if (!config.goldSharePct)
++        return;
++
++    uint32 copper = 0;
++    {
++        std::lock_guard<std::mutex> lock(goldLock);
++        auto itr = goldPending.find(bot->GetGUID().GetCounter());
++        if (itr == goldPending.end() || itr->second < 100)
++            return;
++
++        copper = uint32(std::min<uint64>(itr->second / 100, MAX_MONEY_AMOUNT));
++        itr->second -= uint64(copper) * 100;
++    }
++
++    if (!bot->HasEnoughMoney(copper))
++        return;
++
++    guild->HandleMemberDepositMoney(bot->GetSession(), copper);
++    LOG_INFO("playerbots", "Guild bank exchange: {} shared {} copper (guild {})", bot->GetName(), copper, guild->GetId());
++}
++
++void GuildBankExchangeMgr::OnLootMoney(Player* bot, uint32 gold)
++{
++    if (!config.enabled || !config.goldSharePct || !gold || !IsGuildBot(bot))
++        return;
++
++    std::lock_guard<std::mutex> lock(goldLock);
++    goldPending[bot->GetGUID().GetCounter()] += uint64(gold) * config.goldSharePct;
++}
++
++bool GuildBankExchangeMgr::AskForUpgrade(Player* bot)
++{
++    static std::pair<uint8, char const*> const slots[] = {
++        {EQUIPMENT_SLOT_HEAD, "helm"},      {EQUIPMENT_SLOT_SHOULDERS, "shoulders"}, {EQUIPMENT_SLOT_CHEST, "chest"},
++        {EQUIPMENT_SLOT_WAIST, "belt"},     {EQUIPMENT_SLOT_LEGS, "legs"},           {EQUIPMENT_SLOT_FEET, "boots"},
++        {EQUIPMENT_SLOT_WRISTS, "bracers"}, {EQUIPMENT_SLOT_HANDS, "gloves"},        {EQUIPMENT_SLOT_BACK, "cloak"},
++        {EQUIPMENT_SLOT_MAINHAND, "weapon"}};
++
++    // weakest equipped piece (lowest item level); empty slots are skipped (the bot may not use them)
++    char const* weakest = nullptr;
++    uint32 lowest = UINT32_MAX;
++    for (auto const& [slot, name] : slots)
++    {
++        Item* item = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot);
++        if (!item || !item->GetTemplate())
++            continue;
++
++        if (item->GetTemplate()->ItemLevel < lowest)
++        {
++            lowest = item->GetTemplate()->ItemLevel;
++            weakest = name;
++        }
++    }
++
++    if (!weakest)
++        return false;
++
++    static char const* const classes[] = {"",       "warrior", "paladin", "hunter",  "rogue", "priest",
++                                          "death knight", "shaman", "mage", "warlock", "",      "druid"};
++    uint8 cls = bot->getClass();
++    std::string className = cls < std::size(classes) ? classes[cls] : "";
++
++    Say(bot, "guild_bank_want", "Anyone have a better %slot for a level %level %class? I'll check the guild bank.",
++        {{"%slot", weakest}, {"%level", std::to_string(bot->GetLevel())}, {"%class", className}});
++    LOG_INFO("playerbots", "Guild bank exchange: {} asked for a {} (guild {})", bot->GetName(), weakest,
++             bot->GetGuildId());
++    return true;
++}
++
++void GuildBankExchangeMgr::ThankDepositor(Player* bot, uint32 entry)
++{
++    ObjectGuid::LowType depositor = 0;
++    {
++        std::lock_guard<std::mutex> lock(depositorLock);
++        auto itr = lastDepositor.find((uint64(bot->GetGuildId()) << 32) | entry);
++        if (itr != lastDepositor.end())
++            depositor = itr->second;
++    }
++
++    ItemTemplate const* proto = sObjectMgr->GetItemTemplate(entry);
++    std::string name;
++    if (!proto || !depositor || depositor == bot->GetGUID().GetCounter() ||
++        !sCharacterCache->GetCharacterNameByGuid(ObjectGuid::Create<HighGuid::Player>(depositor), name))
++        return;
++
++    Say(bot, "guild_bank_thanks", "Thanks for the %item, %name!",
++        {{"%item", ChatHelper::FormatItem(proto)}, {"%name", name}});
++}
++
++void GuildBankExchangeMgr::Say(Player* bot, std::string const& name, std::string const& defaultText,
++                               std::map<std::string, std::string> placeholders) const
++{
++    Guild* guild = sGuildMgr->GetGuildById(bot->GetGuildId());
++    if (!guild)
++        return;
++
++    std::string msg = PlayerbotTextMgr::instance().GetBotTextOrDefault(name, defaultText, placeholders);
++    if (!msg.empty())
++        guild->BroadcastToGuild(bot->GetSession(), false, msg, LANG_UNIVERSAL);
++}
++
++void GuildBankExchangeMgr::OnBankEvent(Guild* guild, uint8 eventType, ObjectGuid::LowType playerGuid,
++                                       uint32 itemOrMoney, uint16 count)
++{
++    if (!config.enabled || !guild || !playerGuid)
++        return;
++
++    if (eventType == GUILD_BANK_LOG_DEPOSIT_ITEM)
++    {
++        std::lock_guard<std::mutex> lock(depositorLock);
++        lastDepositor[(uint64(guild->GetId()) << 32) | itemOrMoney] = playerGuid;
++    }
++
++    if (!config.ledger)
++        return;
++
++    uint32 itemsIn = 0, itemsOut = 0, goldIn = 0, goldOut = 0, repairOut = 0;
++    switch (eventType)
++    {
++        case GUILD_BANK_LOG_DEPOSIT_ITEM:
++            itemsIn = count;
++            break;
++        case GUILD_BANK_LOG_WITHDRAW_ITEM:
++            itemsOut = count;
++            break;
++        case GUILD_BANK_LOG_DEPOSIT_MONEY:
++            goldIn = itemOrMoney;
++            break;
++        case GUILD_BANK_LOG_WITHDRAW_MONEY:
++            goldOut = itemOrMoney;
++            break;
++        case GUILD_BANK_LOG_REPAIR_MONEY:
++            repairOut = itemOrMoney;
++            break;
++        default:
++            return;
++    }
++
++    PlayerbotsDatabase.Execute(
++        "INSERT INTO playerbots_guild_ledger (guildid, guid, items_in, items_out, gold_in, gold_out, repair_out) "
++        "VALUES ({}, {}, {}, {}, {}, {}, {}) ON DUPLICATE KEY UPDATE items_in = items_in + {}, items_out = items_out + "
++        "{}, gold_in = gold_in + {}, gold_out = gold_out + {}, repair_out = repair_out + {}",
++        guild->GetId(), playerGuid, itemsIn, itemsOut, goldIn, goldOut, repairOut, itemsIn, itemsOut, goldIn, goldOut,
++        repairOut);
++}
++
++void GuildBankExchangeMgr::OnGuildChat(Player* player, std::string const& msg)
++{
++    if (!config.enabled || !config.needRequests || !player || !player->GetGuildId() || msg.size() < 4)
++        return;
++
++    std::string lower = msg.substr(0, 4);
++    std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
++    if (lower != "need")
++        return;
++
++    uint32 now = uint32(GameTime::GetGameTime().count());
++    for (uint32 entry : ChatHelper::parseItems(msg))
++        needs.push_back({now + urand(config.needDelayMin, config.needDelayMax), player->GetGuildId(), entry,
++                         player->GetGUID().GetCounter()});
++}
++
++void GuildBankExchangeMgr::ProcessNeeds(uint32 now)
++{
++    if (needs.empty())
++        return;
++
++    auto split = std::stable_partition(needs.begin(), needs.end(), [now](NeedRequest const& r) { return r.due > now; });
++    std::vector<NeedRequest> due(split, needs.end());
++    needs.erase(split, needs.end());
++
++    for (NeedRequest const& request : due)
++    {
++        // every online guild bot that carries the item in its bags (never equipped / bank)
++        std::vector<std::pair<Player*, Item*>> holders;
++        for (auto const& [guid, player] : ObjectAccessor::GetPlayers())
++        {
++            if (!player || !player->IsInWorld() || player->GetGuildId() != request.guildId ||
++                player->GetGUID().GetCounter() == request.requester || !IsGuildBot(player) || !player->IsAlive() ||
++                player->IsInCombat() || player->IsBeingTeleported())
++                continue;
++
++            auto consider = [&](Item* item)
++            {
++                if (!item || item->GetEntry() != request.entry || item->IsSoulBound() || !item->CanBeTraded() ||
++                    item->IsNotEmptyBag())
++                    return false;
++                if (!config.needUsable && IsUpgrade(player, item->GetEntry(), item->GetItemRandomPropertyId()))
++                    return false;
++                holders.push_back({player, item});
++                return true;
++            };
++
++            bool found = false;
++            for (uint8 slot = INVENTORY_SLOT_ITEM_START; slot < INVENTORY_SLOT_ITEM_END && !found; ++slot)
++                found = consider(player->GetItemByPos(INVENTORY_SLOT_BAG_0, slot));
++
++            for (uint8 bag = INVENTORY_SLOT_BAG_START; bag < INVENTORY_SLOT_BAG_END && !found; ++bag)
++                if (Bag* pBag = player->GetBagByPos(bag))
++                    for (uint32 slot = 0; slot < pBag->GetBagSize() && !found; ++slot)
++                        found = consider(pBag->GetItemByPos(uint8(slot)));
++        }
++
++        if (holders.empty())
++            continue;
++
++        auto [bot, item] = holders[urand(0, holders.size() - 1)];
++        ItemTemplate const* proto = item->GetTemplate();
++        Guild* guild = sGuildMgr->GetGuildById(bot->GetGuildId());
++        if (!guild || !guild->MemberHasTabRights(bot->GetGUID(), uint8(config.tab), GUILD_BANK_RIGHT_DEPOSIT_ITEM) ||
++            !DepositItem(bot, item))
++            continue;
++
++        std::string name;
++        sCharacterCache->GetCharacterNameByGuid(ObjectGuid::Create<HighGuid::Player>(request.requester), name);
++        LOG_INFO("playerbots", "Guild bank exchange: {} deposited {} for a need request by {} (guild {})",
++                 bot->GetName(), request.entry, name, request.guildId);
++        Say(bot, "guild_bank_need", "Put %item in the guild bank for %name.",
++            {{"%item", ChatHelper::FormatItem(proto)}, {"%name", name}});
++    }
++}
++
++void GuildBankExchangeMgr::OnWhisper(Player* player, Player* receiver, std::string const& msg)
++{
++    if (!config.enabled || !config.ledger || !player || !receiver || !GET_PLAYERBOT_AI(receiver) ||
++        !receiver->GetGuildId() || receiver->GetGuildId() != player->GetGuildId())
++        return;
++
++    std::string lower = msg;
++    std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
++    if (lower != "ledger")
++        return;
++
++    QueryResult result = PlayerbotsDatabase.Query(
++        "SELECT guid, items_in, items_out, gold_in, gold_out, repair_out FROM playerbots_guild_ledger "
++        "WHERE guildid = {} ORDER BY items_in + items_out DESC LIMIT 5",
++        receiver->GetGuildId());
++    if (!result)
++    {
++        receiver->Whisper("The guild ledger is empty.", LANG_UNIVERSAL, player);
++        return;
++    }
++
++    receiver->Whisper("Guild ledger (items in / out, gold in / out / repairs):", LANG_UNIVERSAL, player);
++    do
++    {
++        Field* fields = result->Fetch();
++        std::string name;
++        if (!sCharacterCache->GetCharacterNameByGuid(ObjectGuid::Create<HighGuid::Player>(fields[0].Get<uint32>()),
++                                                     name))
++            name = "?";
++
++        std::ostringstream out;
++        out << name << ": " << fields[1].Get<uint32>() << " / " << fields[2].Get<uint32>() << ", "
++            << ChatHelper::formatMoney(uint32(std::min<uint64>(fields[3].Get<uint64>(), MAX_MONEY_AMOUNT))) << " / "
++            << ChatHelper::formatMoney(uint32(std::min<uint64>(fields[4].Get<uint64>(), MAX_MONEY_AMOUNT))) << " / "
++            << ChatHelper::formatMoney(uint32(std::min<uint64>(fields[5].Get<uint64>(), MAX_MONEY_AMOUNT)));
++        receiver->Whisper(out.str(), LANG_UNIVERSAL, player);
++    } while (result->NextRow());
++}
++
++bool GuildBankExchangeMgr::DepositItem(Player* bot, Item* item)
++{
++    Guild* guild = sGuildMgr->GetGuildById(bot->GetGuildId());
++    if (!guild || !item)
++        return false;
++
++    ObjectGuid itemGuid = item->GetGUID();
++    uint8 bag = item->GetBagSlot();
++    uint8 slot = item->GetSlot();
++    guild->SwapItemsWithInventory(bot, false, uint8(config.tab), NULL_SLOT, bag, slot, 0);
++
++    Item* after = bot->GetItemByPos(bag, slot);
++    return !after || after->GetGUID() != itemGuid;
++}
++
++void GuildBankExchangeMgr::Announce(Player* bot, uint32 givenEntry, uint32 takenEntry) const
++{
++    if (!config.chatChance || urand(1, 100) > config.chatChance)
++        return;
++
++    ItemTemplate const* given = sObjectMgr->GetItemTemplate(givenEntry);
++    if (!given)
++        return;
++
++    if (ItemTemplate const* taken = takenEntry ? sObjectMgr->GetItemTemplate(takenEntry) : nullptr)
++        Say(bot, "guild_bank_swap", "Swapped %item for %other in the guild bank, thanks!",
++            {{"%item", ChatHelper::FormatItem(given)}, {"%other", ChatHelper::FormatItem(taken)}});
++    else
++        Say(bot, "guild_bank_deposit", "Dropped off %item in the guild bank.", {{"%item", ChatHelper::FormatItem(given)}});
++}
++
++bool GuildBankDepositOperation::IsValid() const
++{
++    Player* bot = ObjectAccessor::FindPlayer(m_botGuid);
++    return bot && bot->IsInWorld() && bot->GetGuildId();
++}
++
++bool GuildBankDepositOperation::Execute()
++{
++    Player* bot = ObjectAccessor::FindPlayer(m_botGuid);
++    if (!bot)
++        return false;
++
++    Item* item = bot->GetItemByGuid(m_itemGuid);
++    PlayerbotAI* botAI = GET_PLAYERBOT_AI(bot);
++    if (!item || !botAI)
++        return false;
++
++    std::string const itemLink = ChatHelper::FormatItem(item->GetTemplate());
++    Guild* guild = sGuildMgr->GetGuildById(bot->GetGuildId());
++    if (!guild || !guild->MemberHasTabRights(bot->GetGUID(), uint8(sGuildBankExchangeMgr.GetConfig().tab),
++                                             GUILD_BANK_RIGHT_DEPOSIT_ITEM))
++    {
++        botAI->TellMaster("I can't put " + itemLink + " in the guild bank: no deposit rights on that tab");
++        return false;
++    }
++
++    if (!sGuildBankExchangeMgr.DepositItem(bot, item))
++    {
++        botAI->TellMaster("I can't put " + itemLink + " in the guild bank");
++        return false;
++    }
++
++    botAI->TellMaster(itemLink + " put to guild bank");
++    return true;
++}
++
++class PlayerbotsGuildBankExchangeWorldScript : public WorldScript
++{
++public:
++    PlayerbotsGuildBankExchangeWorldScript()
++        : WorldScript("PlayerbotsGuildBankExchangeWorldScript", {WORLDHOOK_ON_AFTER_CONFIG_LOAD, WORLDHOOK_ON_UPDATE})
++    {
++    }
++
++    void OnAfterConfigLoad(bool /*reload*/) override { sGuildBankExchangeMgr.LoadConfig(); }
++
++    void OnUpdate(uint32 diff) override { sGuildBankExchangeMgr.Update(diff); }
++};
++
++class PlayerbotsGuildBankExchangePlayerScript : public PlayerScript
++{
++public:
++    PlayerbotsGuildBankExchangePlayerScript()
++        : PlayerScript("PlayerbotsGuildBankExchangePlayerScript",
++                       {PLAYERHOOK_ON_BEFORE_LOOT_MONEY, PLAYERHOOK_CAN_PLAYER_USE_PRIVATE_CHAT,
++                        PLAYERHOOK_CAN_PLAYER_USE_GUILD_CHAT})
++    {
++    }
++
++    using PlayerScript::OnPlayerCanUseChat;  // keep the base overloads visible
++
++    // map thread
++    void OnPlayerBeforeLootMoney(Player* player, Loot* loot) override
++    {
++        if (loot)
++            sGuildBankExchangeMgr.OnLootMoney(player, loot->gold);
++    }
++
++    // CMSG_MESSAGECHAT is PROCESS_THREADUNSAFE: world thread
++    bool OnPlayerCanUseChat(Player* player, uint32 type, uint32 /*lang*/, std::string& msg, Player* receiver) override
++    {
++        if (type == CHAT_MSG_WHISPER)
++            sGuildBankExchangeMgr.OnWhisper(player, receiver, msg);
++        return true;
++    }
++
++    bool OnPlayerCanUseChat(Player* player, uint32 type, uint32 /*lang*/, std::string& msg, Guild* /*guild*/) override
++    {
++        if (type == CHAT_MSG_GUILD)
++            sGuildBankExchangeMgr.OnGuildChat(player, msg);
++        return true;
++    }
++};
++
++class PlayerbotsGuildBankExchangeGuildScript : public GuildScript
++{
++public:
++    PlayerbotsGuildBankExchangeGuildScript() : GuildScript("PlayerbotsGuildBankExchangeGuildScript", {GUILDHOOK_ON_BANK_EVENT})
++    {
++    }
++
++    void OnBankEvent(Guild* guild, uint8 eventType, uint8 /*tabId*/, ObjectGuid::LowType playerGuid, uint32 itemOrMoney,
++                     uint16 itemStackCount, uint8 /*destTabId*/) override
++    {
++        sGuildBankExchangeMgr.OnBankEvent(guild, eventType, playerGuid, itemOrMoney, itemStackCount);
++    }
++};
++
++void AddPlayerbotsGuildBankExchangeScripts()
++{
++    new PlayerbotsGuildBankExchangeWorldScript();
++    new PlayerbotsGuildBankExchangePlayerScript();
++    new PlayerbotsGuildBankExchangeGuildScript();
++}
+diff --git a/src/Mgr/Guild/GuildBankExchangeMgr.h b/src/Mgr/Guild/GuildBankExchangeMgr.h
+new file mode 100644
+index 00000000..08b4e86d
+--- /dev/null
++++ b/src/Mgr/Guild/GuildBankExchangeMgr.h
+@@ -0,0 +1,162 @@
++/*
++ * This file is part of the mod-playerbots module for AzerothCore. See AUTHORS file for Copyright
++ * information; released under GNU GPL v2 license, redistribute/modify under version 2 of the License,
++ * or (at your option) any later version.
++ */
++
++#ifndef PLAYERBOTS_GUILDBANKEXCHANGEMGR_H
++#define PLAYERBOTS_GUILDBANKEXCHANGEMGR_H
++
++#include "Common.h"
++#include "ObjectGuid.h"
++#include "PlayerbotOperation.h"
++#include <map>
++#include <mutex>
++#include <unordered_map>
++#include <string>
++#include <vector>
++
++class Guild;
++class Item;
++class Player;
++
++/**
++ * @brief Guild Bank Exchange: guild bots now and then swap one bag item with their guild bank.
++ *
++ * Every bot in a guild gets a timer (MinInterval..MaxInterval seconds). When it runs out and the
++ * Chance roll passes, the bot swaps one random eligible bag item with one slot of the configured
++ * bank tab: an empty slot is a plain deposit, an occupied slot gives the bot that item in return.
++ * No vault trip: the core Guild::SwapItemsWithInventory does every rights / log / DB step.
++ *
++ * Thread safety: bank moves of real players run on the world thread (CMSG_GUILD_BANK_SWAP_ITEMS
++ * is PROCESS_THREADUNSAFE). Update() is called from a WorldScript (world thread, map updates
++ * finished), so the swap is done there directly. The "gb" chat command (bot AI, map thread)
++ * queues a GuildBankDepositOperation on the PlayerbotWorldThreadProcessor when RemoteCommand = 1.
++ *
++ * Tier 2 / 3 (each its own option, default off): SmartTakeChance (aim a swap at a bank item the bot
++ * would wear), equip right after a take, a ledger table, "need <item>" requests in guild chat, bots
++ * asking for upgrades (WantChance), a gold share of looted money, guild bank repairs and taking
++ * greys out of a full tab. The core Guild class keeps bank tabs private, so bank contents are read
++ * from the characters DB (guild_bank_item), which the core keeps in step with every move.
++ */
++struct GuildBankExchangeConfig
++{
++    bool enabled = false;
++    uint32 minInterval = 3600;  // seconds
++    uint32 maxInterval = 7200;
++    uint32 chance = 50;         // % per timer hit
++    uint32 tab = 0;
++    uint32 minQuality = 2;      // green
++    uint32 maxQuality = 4;      // epic
++    bool tradeGoods = true;
++    bool armorWeapons = true;
++    uint32 preferEmptyChance = 50;  // % to use the first free slot instead of a random slot
++    uint32 chatChance = 30;         // % for one guild chat line per swap
++    bool remoteCommand = false;     // "gb <item>" without a nearby vault, via the world thread
++    bool altBots = false;           // also non-random bots
++    bool smartGive = false;         // prefer items the bot cannot use
++    uint32 smartTakeChance = 0;     // % per swap to aim at a bank item the bot would wear
++    bool equipAfterTake = false;    // run the stock auto-equip right after taking an upgrade
++    bool ledger = false;            // per-member totals in playerbots_guild_ledger + "ledger" whisper
++    bool needRequests = false;      // "need <item link>" in guild chat -> a bot that has it deposits it
++    uint32 needDelayMin = 60;       // seconds
++    uint32 needDelayMax = 600;
++    bool needUsable = true;         // bots also give items they could use themselves
++    uint32 wantChance = 0;          // % per timer hit to ask guild chat for an upgrade
++    uint32 goldSharePct = 0;        // % of looted gold deposited on the bot's timer
++    bool guildRepair = false;       // bots repair from the guild bank first (rank repair rights apply)
++    bool cleanupGreys = false;      // take one grey item out of a full tab
++};
++
++struct GuildBankSlotItem
++{
++    uint8 slot;
++    uint32 entry;
++    int32 randomPropertyId;
++};
++
++class GuildBankExchangeMgr
++{
++public:
++    static GuildBankExchangeMgr& instance()
++    {
++        static GuildBankExchangeMgr instance;
++        return instance;
++    }
++
++    void LoadConfig();
++    GuildBankExchangeConfig const& GetConfig() const { return config; }
++
++    // World thread only
++    void Update(uint32 diff);
++    // World thread only: deposit one bag item into the first free slot of the tab; true if it left the bags
++    bool DepositItem(Player* bot, Item* item);
++
++    // Script hooks
++    void OnLootMoney(Player* bot, uint32 gold);  // map thread
++    void OnBankEvent(Guild* guild, uint8 eventType, ObjectGuid::LowType playerGuid, uint32 itemOrMoney,
++                     uint16 count);              // any thread
++    void OnGuildChat(Player* player, std::string const& msg);                  // world thread
++    void OnWhisper(Player* player, Player* receiver, std::string const& msg);  // world thread
++
++private:
++    GuildBankExchangeMgr() = default;
++
++    bool IsEligible(Player* bot, Item* item) const;
++    Item* PickItem(Player* bot) const;
++    bool Exchange(Player* bot);
++    void Announce(Player* bot, uint32 givenEntry, uint32 takenEntry) const;
++    bool IsGuildBot(Player* player) const;
++    std::vector<GuildBankSlotItem> ReadTab(uint32 guildId, uint8 tab) const;
++    int32 PickUpgradeSlot(Player* bot, std::vector<GuildBankSlotItem> const& slots) const;
++    bool IsUpgrade(Player* bot, uint32 entry, int32 randomPropertyId) const;
++    bool TakeGrey(Player* bot, Guild* guild);
++    void ShareGold(Player* bot, Guild* guild);
++    bool AskForUpgrade(Player* bot);
++    void ThankDepositor(Player* bot, uint32 entry);
++    void ProcessNeeds(uint32 now);
++    void Say(Player* bot, std::string const& name, std::string const& defaultText,
++             std::map<std::string, std::string> placeholders) const;
++
++    struct NeedRequest
++    {
++        uint32 due;
++        uint32 guildId;
++        uint32 entry;
++        ObjectGuid::LowType requester;
++    };
++
++    GuildBankExchangeConfig config;
++    uint32 checkTimer = 0;
++    std::unordered_map<ObjectGuid::LowType, uint32> nextExchange;  // bot guid -> game time (s) of the next try
++    std::unordered_map<ObjectGuid::LowType, uint32> wanting;       // bot guid -> game time (s) the ask ends
++    std::vector<NeedRequest> needs;                                // world thread only
++
++    std::mutex goldLock;                                           // OnLootMoney runs on map threads
++    std::unordered_map<ObjectGuid::LowType, uint64> goldPending;   // bot guid -> copper x 100
++
++    std::mutex depositorLock;                                      // OnBankEvent runs on any thread
++    std::unordered_map<uint64, ObjectGuid::LowType> lastDepositor; // (guild << 32 | entry) -> member guid
++};
++
++#define sGuildBankExchangeMgr GuildBankExchangeMgr::instance()
++
++// Queued by the "gb" chat command (map thread), run on the world thread
++class GuildBankDepositOperation : public PlayerbotOperation
++{
++public:
++    GuildBankDepositOperation(ObjectGuid botGuid, ObjectGuid itemGuid) : m_botGuid(botGuid), m_itemGuid(itemGuid) {}
++
++    bool Execute() override;
++    ObjectGuid GetBotGuid() const override { return m_botGuid; }
++    std::string GetName() const override { return "GuildBankDeposit"; }
++    bool IsValid() const override;
++
++private:
++    ObjectGuid m_botGuid;
++    ObjectGuid m_itemGuid;
++};
++
++void AddPlayerbotsGuildBankExchangeScripts();
++
++#endif
+diff --git a/src/Script/Playerbots.cpp b/src/Script/Playerbots.cpp
+index 669eefb1..266cf29c 100644
+--- a/src/Script/Playerbots.cpp
++++ b/src/Script/Playerbots.cpp
+@@ -597,6 +597,7 @@ public:
+ 
+ void AddPlayerbotsSecureLoginScripts();
+ void AddPlayerbotsSelfBotAfkScripts();
++void AddPlayerbotsGuildBankExchangeScripts();
+ 
+ void AddSC_MagtheridonBotScripts();
+ void AddSC_TempestKeepBotScripts();
+@@ -619,6 +620,7 @@ void AddPlayerbotsScripts()
+     new PlayerBotsBGScript();
+     AddPlayerbotsSecureLoginScripts();
+     AddPlayerbotsSelfBotAfkScripts();
++    AddPlayerbotsGuildBankExchangeScripts();
+     AddPlayerbotsCommandscripts();
+     PlayerBotsGuildValidationScript();
+     AddSC_MagtheridonBotScripts();

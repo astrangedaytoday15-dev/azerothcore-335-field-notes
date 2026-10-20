@@ -14,6 +14,7 @@ run the project with Claude Code.
 | [02_Custom_Spells.md](02_Custom_Spells.md) | How spells are built and how they interact: the layers, procs, stacking, spell mods, scripts, math |
 | [03_Gotchas.md](03_Gotchas.md) | Symptom / cause / fix catalog: traps that cost us time |
 | [04_Workflow_With_Claude.md](04_Workflow_With_Claude.md) | How the project runs with an AI coding assistant: docs as memory, safe DB writes, tests |
+| [playerbots-guild-bank-exchange/](playerbots-guild-bank-exchange/README.md) | Extra: a standalone mod-playerbots patch that lets guild bots use the guild bank (GPL-2.0) |
 
 ## How much to trust a line
 
@@ -62,6 +63,9 @@ you build on it.
 
 **Code samples** written for this project (the addon in guide 01): MIT (see
 `LICENSE-CODE`).
+
+**The playerbots patch** in `playerbots-guild-bank-exchange/` modifies
+mod-playerbots, so it is GPL-2.0-or-later (its own `COPYING`).
 
 **Third-party projects:** AzerothCore (GPL-2.0-or-later, per its file
 headers), mod-playerbots (GPL-2.0) and mod-ale (GPL-3.0) belong to their

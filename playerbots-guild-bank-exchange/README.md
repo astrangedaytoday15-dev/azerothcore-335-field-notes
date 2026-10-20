@@ -63,7 +63,10 @@ applied by the normal DB updater at the next start.
   context drift) before you use it on master.
 
 Guild setup: buy at least one bank tab, and give the bots' rank deposit and
-(if you want swaps) withdraw rights with a small daily cap. A bot without
+(if you want swaps) withdraw rights with a small daily cap. For `GuildRepair`,
+the bots' rank also needs a daily repair allowance (guild rank money per
+day above 0) and the bank needs gold; with the allowance at 0 the bot just
+repairs with its own gold. A bot without
 rights simply does nothing. On our server, guild bots were only online while
 a real member of their guild was, so expect few exchanges in a quiet guild.
 

@@ -29,10 +29,10 @@ compiled and running, not tested yet; **[Source]** read in source.
 | Give away armor / weapons the bot cannot use first | `SmartGive` | **[Built]** (running since the first build) |
 | One guild chat line per exchange | `ChatChance` | **[Log]** |
 | Bots deposit a share of looted gold | `GoldSharePct` | **[Log]** |
-| Per-member ledger (items in / out, gold in / out, repairs); whisper a guild bot `ledger` for the top 5 | `Ledger` | **[Log]** (rows match the core's bank log) |
+| Per-member ledger (items in / out, gold in / out, repairs); whisper a guild bot `ledger` for the top 5 | `Ledger` | **[Tested]** |
 | Aim swaps at bank items the bot would wear | `SmartTakeChance` | **[Built]** |
 | Equip that upgrade right away (normal auto-equip choice, never forced) | `EquipAfterTake` | **[Built]** |
-| `need <item link>` in guild chat: a bot carrying it deposits it after a delay | `NeedRequests` | **[Built]** |
+| `need <item link>` in guild chat: a bot carrying it deposits it after a delay | `NeedRequests` | **[Tested]** |
 | A bot asks guild chat for an upgrade of its weakest piece and thanks whoever deposits one | `WantChance` | **[Built]** |
 | Repair from the guild bank first (rank rights and daily limit apply) | `GuildRepair` | **[Built]** |
 | Full tab: take one grey item out to sell later | `CleanupGreys` | **[Built]** |
@@ -145,9 +145,9 @@ Values we run: `Enabled 1`, `SmartGive 1`, `SmartTakeChance 30`,
 9. `RemoteCommand 1`: `gb <item>` works away from a vault.
 10. Each **[Built]** option above, one at a time.
 
-On our server the basic exchange and `gb` passed an in-game test, and the
-logs match the core's bank log one to one. The list above has not yet been
-run item by item.
+On our server the basic exchange, `gb`, the ledger whisper and need
+requests passed an in-game test, and the logs match the core's bank log one
+to one. The options still tagged **[Built]** are under test.
 
 ## 6. Known limits
 

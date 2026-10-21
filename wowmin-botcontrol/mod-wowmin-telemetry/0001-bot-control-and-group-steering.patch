@@ -1,0 +1,429 @@
+diff --git a/conf/mod-wowmin-telemetry.conf.dist b/conf/mod-wowmin-telemetry.conf.dist
+index ffd3543..d6a1e7c 100644
+--- a/conf/mod-wowmin-telemetry.conf.dist
++++ b/conf/mod-wowmin-telemetry.conf.dist
+@@ -65,3 +65,43 @@ WowMinTelemetry.Stream.Port = 7979
+ #
+ 
+ WowMinTelemetry.Stream.IntervalMs = 100
++
++#
++#    WowMinTelemetry.BotCommand.Enable
++#        Description: Bot control patch. Enables the
++#                     administrator-only "wowmin botcmd <bot> <command>" command:
++#                     one allowlisted playerbot command to a bot, as if
++#                     whispered. Bots only; a bot of another real player is
++#                     refused. Allowlist: stay, grind, flee, reset botAI,
++#                     release, co/nc +/-<strategy>; with the owner as master
++#                     also follow, summon, attack, tank attack. Rate limit
++#                     1 per bot per second, 30 per minute. Requires
++#                     WowMinTelemetry.Enable and mod-playerbots.
++#        Default:     0 - Disabled
++#                     1 - Enabled
++#
++
++WowMinTelemetry.BotCommand.Enable = 0
++
++#
++#    WowMinTelemetry.BotCommand.OwnerAccount
++#        Description: Account id whose characters count as "the owner" for
++#                     master commands and for bots grouped with a real player.
++#                     0 = no owner: master commands are refused.
++#        Default:     0
++#
++
++WowMinTelemetry.BotCommand.OwnerAccount = 0
++
++#
++#    WowMinTelemetry.BotCommand.MoveMaxYards
++#        Description: Bot control patch, group steering. The furthest point
++#                     "wowmin botcmd <bot> moveto <x> <y> <z>" sends a bot to,
++#                     in yards from the bot (5-250). The bot walks there with
++#                     pathfinding ("go x;y;z"); it needs the owner as master,
++#                     or is the owner's own self-bot. "wowmin botmark" (raid
++#                     icon for the owner's group) uses BotCommand.Enable too.
++#        Default:     60
++#
++
++WowMinTelemetry.BotCommand.MoveMaxYards = 60
+diff --git a/src/WowMinTelemetry.cpp b/src/WowMinTelemetry.cpp
+index 5dce8ff..0b14aa5 100644
+--- a/src/WowMinTelemetry.cpp
++++ b/src/WowMinTelemetry.cpp
+@@ -7,6 +7,7 @@
+ #include <atomic>
+ #include <boost/asio/io_context.hpp>
+ #include <boost/asio/ip/udp.hpp>
++#include <cctype>
+ #include <cmath>
+ #include <cstdint>
+ #include <cstring>
+@@ -15,6 +16,7 @@
+ #include <memory>
+ #include <mutex>
+ #include <optional>
++#include <set>
+ #include <shared_mutex>
+ #include <sstream>
+ #include <string>
+@@ -64,7 +66,9 @@
+ #include "Engine.h"
+ #include "LastMovementValue.h"
+ #include "PlayerbotAI.h"
++#include "PlayerbotAIConfig.h"
+ #include "PlayerbotMgr.h"
++#include "PositionValue.h"
+ #endif
+ 
+ using namespace Acore::ChatCommands;
+@@ -78,6 +82,9 @@ enum class WowMinTelemetryConfig
+     StreamHost,
+     StreamPort,
+     StreamIntervalMs,
++    BotCommandEnabled,
++    BotCommandOwnerAccount,
++    BotCommandMoveMaxYards,
+ 
+     NumConfigs,
+ };
+@@ -94,6 +101,11 @@ public:
+         SetConfigValue<std::string>(WowMinTelemetryConfig::StreamHost, "WowMinTelemetry.Stream.Host", "127.0.0.1");
+         SetConfigValue<uint32>(WowMinTelemetryConfig::StreamPort, "WowMinTelemetry.Stream.Port", 7979);
+         SetConfigValue<uint32>(WowMinTelemetryConfig::StreamIntervalMs, "WowMinTelemetry.Stream.IntervalMs", 100);
++        // Bot control patch: "wowmin botcmd".
++        SetConfigValue<bool>(WowMinTelemetryConfig::BotCommandEnabled, "WowMinTelemetry.BotCommand.Enable", false);
++        SetConfigValue<uint32>(WowMinTelemetryConfig::BotCommandOwnerAccount, "WowMinTelemetry.BotCommand.OwnerAccount", 0);
++        // Group steering: "moveto" and "wowmin botmark".
++        SetConfigValue<uint32>(WowMinTelemetryConfig::BotCommandMoveMaxYards, "WowMinTelemetry.BotCommand.MoveMaxYards", 60);
+     }
+ };
+ 
+@@ -1771,6 +1783,10 @@ public:
+         static ChatCommandTable wowminCommandTable = {
+             {"telemetry", HandleTelemetryCommand, SEC_ADMINISTRATOR, Console::Yes},
+             {"stream", HandleStreamCommand, SEC_ADMINISTRATOR, Console::Yes},
++            {"botcmd", HandleBotCommand, SEC_ADMINISTRATOR, Console::Yes},
++#ifdef MOD_PLAYERBOTS
++            {"botmark", HandleBotMarkCommand, SEC_ADMINISTRATOR, Console::Yes},
++#endif
+         };
+ 
+         static ChatCommandTable commandTable = {
+@@ -1867,6 +1883,317 @@ public:
+         return true;
+     }
+ 
++    // Bot control patch: sends one allowlisted playerbot
++    // command to a bot, as if whispered. Self commands come from the bot
++    // itself; master commands from its master, who must be on the owner's
++    // account. Replies "WBOTCMD|ok|<bot>|<command>", "WBOTCMD|refused|<reason>"
++    // or "WBOTCMD|disabled".
++    // Group steering: the owner's own self-bot (the driven leader) takes self
++    // commands, and "moveto <x> <y> <z>" walks a bot with a master to a point
++    // (module-built "go x;y;z"; a bot on "stay" keeps the point as its stay
++    // position, as SeeSpellAction::MoveToSpell does).
++    static bool HandleBotCommand(ChatHandler* handler, char const* args)
++    {
++        if (!telemetryConfig.GetConfigValue<bool>(WowMinTelemetryConfig::Enabled) ||
++            !telemetryConfig.GetConfigValue<bool>(WowMinTelemetryConfig::BotCommandEnabled))
++        {
++            handler->SendSysMessage("WBOTCMD|disabled");
++            return true;
++        }
++#ifdef MOD_PLAYERBOTS
++        std::istringstream arguments(args ? args : "");
++        std::string botName;
++        arguments >> botName;
++        std::string text;
++        std::string word;
++        while (arguments >> word)
++            text += (text.empty() ? "" : " ") + word;
++        if (botName.empty() || text.empty())
++        {
++            // true: a false return comes back over SOAP as a Fault.
++            handler->SendSysMessage("Usage: wowmin botcmd <botName> <command>");
++            return true;
++        }
++
++        auto refuse = [handler](std::string_view reason)
++        {
++            handler->PSendSysMessage("WBOTCMD|refused|{}", reason);
++            return true;
++        };
++
++        BotCommandKind kind = BotCommandKind::Refused;
++        std::string command;
++        float moveX = 0.0f, moveY = 0.0f, moveZ = 0.0f;
++        if (text.rfind("moveto ", 0) == 0)
++        {
++            if (!ParseMovePoint(text.substr(7), moveX, moveY, moveZ))
++                return refuse("bad point");
++            kind = BotCommandKind::Move;
++        }
++        else
++            command = NormalizeBotCommand(text, kind);
++        if (kind == BotCommandKind::Refused)
++            return refuse("not allowed");
++
++        Player* bot = ObjectAccessor::FindPlayerByName(botName);
++        PlayerbotAI* botAI = bot ? sPlayerbotsMgr.GetPlayerbotAI(bot) : nullptr;
++        if (!botAI)
++            return refuse("no such bot online");
++        Player* master = botAI->GetMaster();
++        uint32 const ownerAccount =
++            telemetryConfig.GetConfigValue<uint32>(WowMinTelemetryConfig::BotCommandOwnerAccount);
++        auto onOwnerAccount = [ownerAccount](Player* player)
++        { return ownerAccount && player->GetSession() && player->GetSession()->GetAccountId() == ownerAccount; };
++        // A self-bot is a real person playing with bot help: only the owner's
++        // own (the driven leader) is steered from here.
++        bool const selfBot = master == bot;
++        if (selfBot && !onOwnerAccount(bot))
++            return refuse("not a bot");
++        // The master is a person: playing by hand, or the owner as a self-bot.
++        bool const realMaster = master && (IsRealPlayer(master) || IsSelfBot(master));
++        bool const ownerMaster = realMaster && onOwnerAccount(master);
++        if (realMaster && !ownerMaster)
++            return refuse("bot of another player");
++        if (kind == BotCommandKind::Master && selfBot)
++            return refuse("the leader is its own master");
++        if ((kind == BotCommandKind::Master || kind == BotCommandKind::Move) && !ownerMaster)
++            return refuse("needs the owner as master");
++
++        if (kind == BotCommandKind::Move)
++        {
++            float const maxYards = float(std::clamp<uint32>(
++                telemetryConfig.GetConfigValue<uint32>(WowMinTelemetryConfig::BotCommandMoveMaxYards), 5, 250));
++            if (bot->GetExactDist(moveX, moveY, moveZ) > maxYards)
++                return refuse("too far");
++            float const ground = bot->GetMap()->GetHeight(bot->GetPhaseMask(), moveX, moveY, moveZ + 3.0f, true, 20.0f);
++            if (ground <= INVALID_HEIGHT || std::fabs(ground - moveZ) > 8.0f)
++                return refuse("no ground there");
++            moveZ = ground;
++            command = Acore::StringFormat("go {:.2f};{:.2f};{:.2f}", moveX, moveY, moveZ);
++        }
++
++        if (kind == BotCommandKind::Strategy)
++        {
++            AiObjectContext* context = botAI->GetAiObjectContext();
++            std::set<std::string> const supported =
++                context ? context->GetSupportedStrategies() : std::set<std::string>();
++            if (!supported.count(command.substr(4)))
++                return refuse("unknown strategy");
++        }
++
++        if (!TakeBotCommandSlot(bot->GetGUID().GetCounter(), GameTime::GetGameTimeMS().count()))
++            return refuse("rate limit");
++
++        if (kind == BotCommandKind::Move &&
++            (botAI->HasStrategy("stay", BOT_STATE_NON_COMBAT) || botAI->HasStrategy("stay", BOT_STATE_COMBAT)))
++        {
++            // Otherwise the bot walks back to where "stay" was given.
++            PositionMap& positions = botAI->GetAiObjectContext()->GetValue<PositionMap&>("position")->Get();
++            for (char const* name : {"stay", "return"})
++            {
++                PositionInfo position = positions[name];
++                position.Set(moveX, moveY, moveZ, bot->GetMapId());
++                positions[name] = position;
++            }
++        }
++
++        Player* from = kind == BotCommandKind::Master || (kind == BotCommandKind::Move && !selfBot) ? master : bot;
++        botAI->HandleCommand(CHAT_MSG_WHISPER, sPlayerbotAIConfig.commandPrefix + command, from);
++        LOG_INFO("module", "WoWMin botcmd: {} <- \"{}\" (from {})", bot->GetName(), command, from->GetName());
++        std::string const shown =
++            kind == BotCommandKind::Move ? Acore::StringFormat("moveto {:.2f} {:.2f} {:.2f}", moveX, moveY, moveZ) : command;
++        handler->PSendSysMessage("WBOTCMD|ok|{}|{}", bot->GetName(), shown);
++        return true;
++#else
++        handler->SendSysMessage("WBOTCMD|disabled");
++        return true;
++#endif
++    }
++
++#ifdef MOD_PLAYERBOTS
++    enum class BotCommandKind
++    {
++        Refused,
++        Self,
++        Master,
++        Strategy,
++        Move,
++    };
++
++    // "<x> <y> <z>": three finite numbers, nothing else.
++    static bool ParseMovePoint(std::string const& text, float& x, float& y, float& z)
++    {
++        std::istringstream stream(text);
++        std::array<std::string, 3> words;
++        std::string extra;
++        if (!(stream >> words[0] >> words[1] >> words[2]) || (stream >> extra))
++            return false;
++        std::array<float, 3> values{};
++        for (std::size_t index = 0; index < words.size(); ++index)
++        {
++            Optional<float> const value = Acore::StringTo<float>(words[index]);
++            if (!value || !std::isfinite(*value))
++                return false;
++            values[index] = *value;
++        }
++        x = values[0];
++        y = values[1];
++        z = values[2];
++        return true;
++    }
++
++    // Group steering: "wowmin botmark <player> <icon> <entry> <unitId>" puts a raid
++    // icon on a creature for the player's group, as a player marking in game
++    // (bots attack the "skull" by default, RtiValue); "... <icon> clear"
++    // removes it. The player is the owner's character; the creature is given
++    // by entry and the stream's unit id (GetStreamUnitId). Replies
++    // "WBOTMARK|ok|<icon>|<entry>|<unitId>", "WBOTMARK|cleared|<icon>",
++    // "WBOTMARK|refused|<reason>" or "WBOTMARK|disabled".
++    static bool HandleBotMarkCommand(ChatHandler* handler, char const* args)
++    {
++        if (!telemetryConfig.GetConfigValue<bool>(WowMinTelemetryConfig::Enabled) ||
++            !telemetryConfig.GetConfigValue<bool>(WowMinTelemetryConfig::BotCommandEnabled))
++        {
++            handler->SendSysMessage("WBOTMARK|disabled");
++            return true;
++        }
++        auto refuse = [handler](std::string_view reason)
++        {
++            handler->PSendSysMessage("WBOTMARK|refused|{}", reason);
++            return true;
++        };
++        std::istringstream arguments(args ? args : "");
++        std::string playerName, iconName, entryText, unitText, extra;
++        arguments >> playerName >> iconName >> entryText >> unitText;
++        if (playerName.empty() || iconName.empty() || entryText.empty() || (arguments >> extra))
++        {
++            handler->SendSysMessage("Usage: wowmin botmark <player> <icon> <entry> <unitId> | <player> <icon> clear");
++            return true;
++        }
++        static std::array<std::string_view, 8> const icons = {
++            "star", "circle", "diamond", "triangle", "moon", "square", "cross", "skull"};
++        auto const icon = std::find(icons.begin(), icons.end(), iconName);
++        if (icon == icons.end())
++            return refuse("unknown icon");
++        uint8 const iconIndex = uint8(icon - icons.begin());
++
++        Player* player = ObjectAccessor::FindPlayerByName(playerName);
++        if (!player)
++            return refuse("no such player online");
++        uint32 const ownerAccount =
++            telemetryConfig.GetConfigValue<uint32>(WowMinTelemetryConfig::BotCommandOwnerAccount);
++        if (!ownerAccount || !player->GetSession() || player->GetSession()->GetAccountId() != ownerAccount)
++            return refuse("not the owner");
++        Group* group = player->GetGroup();
++        if (!group)
++            return refuse("not in a group");
++
++        if (entryText == "clear" && unitText.empty())
++        {
++            if (!TakeBotCommandSlot(player->GetGUID().GetCounter(), GameTime::GetGameTimeMS().count()))
++                return refuse("rate limit");
++            group->SetTargetIcon(iconIndex, player->GetGUID(), ObjectGuid::Empty);
++            LOG_INFO("module", "WoWMin botmark: {} cleared {}", player->GetName(), iconName);
++            handler->PSendSysMessage("WBOTMARK|cleared|{}", iconName);
++            return true;
++        }
++
++        Optional<uint32> const entry = Acore::StringTo<uint32>(entryText);
++        Optional<uint32> const unitId = Acore::StringTo<uint32>(unitText);
++        if (!entry || !unitId)
++            return refuse("bad creature");
++        uint32 const counter = *unitId & ~(STREAM_GUID_TYPE_MASK << STREAM_GUID_TYPE_SHIFT);
++        uint32 const type = (*unitId >> STREAM_GUID_TYPE_SHIFT) & STREAM_GUID_TYPE_MASK;
++        ObjectGuid guid;
++        if (type == (uint32(HighGuid::Unit) & STREAM_GUID_TYPE_MASK))
++            guid = ObjectGuid::Create<HighGuid::Unit>(*entry, counter);
++        else if (type == (uint32(HighGuid::Vehicle) & STREAM_GUID_TYPE_MASK))
++            guid = ObjectGuid::Create<HighGuid::Vehicle>(*entry, counter);
++        else
++            return refuse("bad creature");
++        Creature* creature = player->GetMap()->GetCreature(guid);
++        if (!creature || !creature->IsInWorld() || !creature->IsAlive())
++            return refuse("no such creature");
++        if (creature->GetCharmerOrOwnerGUID().IsPlayer())
++            return refuse("a player's pet");
++        if (player->GetExactDist(creature) > sPlayerbotAIConfig.sightDistance)
++            return refuse("too far");
++        if (!TakeBotCommandSlot(player->GetGUID().GetCounter(), GameTime::GetGameTimeMS().count()))
++            return refuse("rate limit");
++
++        group->SetTargetIcon(iconIndex, player->GetGUID(), creature->GetGUID());
++        LOG_INFO("module", "WoWMin botmark: {} put {} on {} ({})", player->GetName(), iconName, creature->GetName(),
++                 creature->GetGUID().ToString());
++        handler->PSendSysMessage("WBOTMARK|ok|{}|{}|{}", iconName, *entry, *unitId);
++        return true;
++    }
++
++    // Allowlist v1 (see the bot control README). Returns the command as
++    // playerbots expects it, or sets kind to Refused.
++    static std::string NormalizeBotCommand(std::string const& text, BotCommandKind& kind)
++    {
++        kind = BotCommandKind::Refused;
++        std::string lower;
++        for (char const character : text)
++        {
++            // Letters, digits, spaces, + and - only: no command separators.
++            if (!std::isalnum(static_cast<unsigned char>(character)) && character != ' ' && character != '+' &&
++                character != '-')
++                return {};
++            lower += char(std::tolower(static_cast<unsigned char>(character)));
++        }
++
++        static std::array<std::pair<std::string_view, std::string_view>, 5> const selfCommands = {{
++            {"stay", "stay"},
++            {"grind", "grind"},
++            {"flee", "flee"},
++            {"reset botai", "reset botAI"},
++            {"release", "release"},
++        }};
++        for (auto const& [name, sent] : selfCommands)
++            if (lower == name)
++            {
++                kind = BotCommandKind::Self;
++                return std::string(sent);
++            }
++
++        static std::array<std::string_view, 4> const masterCommands = {"follow", "summon", "attack", "tank attack"};
++        for (std::string_view const name : masterCommands)
++            if (lower == name)
++            {
++                kind = BotCommandKind::Master;
++                return lower;
++            }
++
++        // "co +<s>", "co -<s>", "nc +<s>", "nc -<s>": one strategy at a time.
++        if (lower.size() > 4 && (lower.rfind("co ", 0) == 0 || lower.rfind("nc ", 0) == 0) &&
++            (lower[3] == '+' || lower[3] == '-'))
++        {
++            std::string_view const name = std::string_view(lower).substr(4);
++            if (name.front() == ' ' || name.find_first_of("+-") != std::string_view::npos)
++                return {};
++            kind = BotCommandKind::Strategy;
++            return lower;
++        }
++        return {};
++    }
++
++    // 1 command per bot per second, 30 per minute in all. World thread only.
++    static bool TakeBotCommandSlot(uint32 botGuid, uint64 nowMs)
++    {
++        static std::unordered_map<uint32, uint64> lastByBot;
++        static std::deque<uint64> recent;
++        while (!recent.empty() && nowMs - recent.front() >= 60000)
++            recent.pop_front();
++        auto const iterator = lastByBot.find(botGuid);
++        if (recent.size() >= 30 || (iterator != lastByBot.end() && nowMs - iterator->second < 1000))
++            return false;
++        lastByBot[botGuid] = nowMs;
++        recent.push_back(nowMs);
++        return true;
++    }
++#endif
++
+     static bool HandleTelemetryCommand(ChatHandler* handler, char const* args)
+     {
+         if (!telemetryConfig.GetConfigValue<bool>(WowMinTelemetryConfig::Enabled))

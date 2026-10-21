@@ -1,0 +1,1084 @@
+From c3639e3b45918e3ef3a78e0f3a6e3dad74805d18 Mon Sep 17 00:00:00 2001
+From: astrangedaytoday15-dev <342675337+astrangedaytoday15-dev@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 05:30:33 -0400
+Subject: [PATCH 2/3] Bot Control B3: command panel
+
+One bot command panel on the Live Map (selected bot), in World 3D
+(followed bot) and in Instance Watch (selected party bot): self command
+buttons, master buttons for a bot in the owner's group, strategy chips
+from the live WMB1 sample (click removes, "+" adds from a short list), a
+text box for one allowlisted command, and the reply line. The panel is
+built once and updated in place, so redraws keep typing and open lists;
+a strategy change is highlighted when the next sample shows it.
+
+World 3D now keeps the stream's bot decisions. A "Bot commands" option
+(bot-commands.json in the data dir, off by default) hides the panels and
+refuses sends without a restart. WOWMIN_BOT_OWNER_ACCOUNT names the
+owner's account for the master buttons. The allowlist mirror moves to
+bot-command-rules.ts so the renderer shares it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ renderer/index.html                         |   5 +
+ renderer/scripts/app.ts                     | 118 ++++++++-
+ renderer/scripts/types/wowmin-api.ts        |   8 +
+ renderer/scripts/utils/bot-command-panel.ts | 275 ++++++++++++++++++++
+ renderer/scripts/web-api.ts                 |   5 +
+ renderer/styles.css                         |  47 ++++
+ scripts/test-bot-command.cjs                |  72 ++++-
+ src/api-backend.ts                          |  16 +-
+ src/bot-command-rules.ts                    | 118 +++++++++
+ src/bot-command.ts                          | 128 ++++-----
+ src/types/api.ts                            |   9 +
+ 11 files changed, 711 insertions(+), 90 deletions(-)
+ create mode 100644 renderer/scripts/utils/bot-command-panel.ts
+ create mode 100644 src/bot-command-rules.ts
+
+diff --git a/renderer/index.html b/renderer/index.html
+index 8a74836..9e94bcb 100644
+--- a/renderer/index.html
++++ b/renderer/index.html
+@@ -1090,6 +1090,9 @@ SELECT * FROM creature_template WHERE entry = 1;" spellcheck="false"></textarea>
+             <label class="auto-refresh-toggle">
+               <input type="checkbox" id="map-show-bot-waypoint" checked /> Show selected bot waypoint
+             </label>
++            <label class="auto-refresh-toggle" title="Owner-only playerbot commands; off refuses every send">
++              <input type="checkbox" id="map-bot-commands" /> Bot commands
++            </label>
+             <label class="filter-label">Show
+               <select id="map-filter-type">
+                 <option value="all" selected>All</option>
+@@ -1302,6 +1305,8 @@ SELECT * FROM creature_template WHERE entry = 1;" spellcheck="false"></textarea>
+           <div id="instance-bot-decisions" class="card-body instance-bot-decisions"></div>
+         </div>
+ 
++        <div id="instance-bot-commands" class="instance-bot-commands"></div>
++
+         <div id="instance-participants-card" class="card instance-player-list-card">
+           <div class="card-header"><h3>Participants</h3></div>
+           <div id="instance-player-list" class="instance-player-list">
+diff --git a/renderer/scripts/app.ts b/renderer/scripts/app.ts
+index 50fef2e..7d9161f 100644
+--- a/renderer/scripts/app.ts
++++ b/renderer/scripts/app.ts
+@@ -21,8 +21,10 @@ import { getEnglishMotd, getServerUptime } from './utils/dashboard-data';
+ import { calculateSessionTotalsAt, formatSessionReplayTime, isSessionRouteDiscontinuity } from './utils/session-replay';
+ import { getClassIconHtml, getClassIconImage, getPlayerStateIconsHtml, getPlayerStateIndicators, getRacePortraitHtml, getResponsivePlayerIconScale, getStateIconImage, loadPlayerIconManifest } from './utils/player-icons';
+ import { formatBattlegroundOutcome } from '../../src/session-outcome';
++import { canUseMasterCommands } from '../../src/bot-command-rules';
++import { BotCommandPanel, type BotCommandTarget, describeBotCommandResult } from './utils/bot-command-panel';
+ import { AppState, createInitialState, PlayerInfo } from './types/state';
+-import type { CreatureInfo, StreamBotDecision, StreamCreatureSample, StreamStatus } from '../../src/types/api';
++import type { BotCommandResult, BotCommandSettings, CreatureInfo, StreamBotDecision, StreamCreatureSample, StreamStatus } from '../../src/types/api';
+ import type { ConnectionProfile, DbConfig, SoapConfig, EntityMediaPreviewResult, LogMonitorConfig, LogMonitorInspectionResult, MapBattlegroundState, MapInstanceDeath, MapInstanceState, MapPlayerPosition, MapBotWaypoint, CharacterInventoryResult, EconomyOverview, EconomyCharacterGoldResult, EconomyAuctionRow, EconomyMarketSummaryRow, SessionIndexEntry, SessionRecord, SessionRoutePoint } from '../../src/types/api';
+ import { bindInventoryTableTooltips, formatInventoryLocation, ITEM_QUALITY_COLOR } from './inventory/wow-item-tooltip';
+ 
+@@ -6085,10 +6087,11 @@ function renderMapSelectedPanel(): void {
+   const panel = $<HTMLElement>('map-selected-panel');
+   if (!panel) return;
+ 
+-  if (!mapSelectedPlayerName) { panel.classList.add('hidden'); return; }
++  if (!mapSelectedPlayerName) { panel.classList.add('hidden'); updateMapBotCommands(null); return; }
+ 
+   const player = mapAllPlayers.find((p) => p.name === mapSelectedPlayerName);
+-  if (!player) { panel.classList.add('hidden'); return; }
++  if (!player) { panel.classList.add('hidden'); updateMapBotCommands(null); return; }
++  updateMapBotCommands(player);
+ 
+   const nameEl    = $<HTMLElement>('map-sel-name');
+   const detailsEl = $<HTMLElement>('map-sel-details');
+@@ -6129,6 +6132,87 @@ function renderMapSelectedPanel(): void {
+   panel.classList.remove('hidden');
+ }
+ 
++// ── Bot commands ─────────────────────────────────────
++// Owner-only playerbot commands through "wowmin botcmd". One panel each on
++// the Live Map, in World 3D and in Instance Watch; all hidden while the
++// "Bot commands" option is off, which also refuses sends in the backend.
++const $mapBotCommands = $<HTMLInputElement>('map-bot-commands');
++let botCommandSettings: BotCommandSettings = { enabled: false, ownerAccountId: 0 };
++
++function onBotCommandResult(bot: string, command: string, result: BotCommandResult): void {
++  logActivity(`bot ${bot}: ${command}`, describeBotCommandResult(result), result.success);
++}
++
++function createBotCommandPanel(parent: HTMLElement | null, className: string, storageKey: string): BotCommandPanel {
++  const panel = new BotCommandPanel(
++    (bot, command, source) => window.wowminAPI.bots.command(bot, command, source),
++    onBotCommandResult,
++    storageKey,
++  );
++  panel.root.classList.add(className);
++  parent?.append(panel.root);
++  return panel;
++}
++
++const mapBotPanel = createBotCommandPanel(
++  $<HTMLElement>('map-selected-panel')?.parentElement ?? null, 'bot-cmd-map', 'wowmin.botCommands.map.collapsed');
++
++function botCommandTarget(
++  player: MapPlayerPosition | null | undefined,
++  players: MapPlayerPosition[],
++  decision: StreamBotDecision | null,
++  noLiveData: string,
++): BotCommandTarget | null {
++  if (!botCommandSettings.enabled || !player || !isMapBot(player)) return null;
++  return {
++    name: player.name,
++    masterAllowed: canUseMasterCommands(player, players, botCommandSettings.ownerAccountId),
++    decision,
++    noLiveData,
++  };
++}
++
++// The Live Map has live strategies only for the unit World 3D follows.
++function updateMapBotCommands(player: MapPlayerPosition | null): void {
++  const now = performance.now();
++  const decision = player && world3dName === player.name ? world3dLive.bots.get(player.name, now) : null;
++  mapBotPanel.update(botCommandTarget(player, mapAllPlayers, decision, 'No live strategies: follow it in 3D.'), now);
++}
++
++function refreshBotCommandPanels(): void {
++  if ($mapBotCommands) $mapBotCommands.checked = botCommandSettings.enabled;
++  renderMapSelectedPanel();
++  world3dBotPanelAt = 0;
++  instanceBotCardRenderedAt = 0;
++  if (!botCommandSettings.enabled) {
++    world3dBotPanel.update(null);
++    instanceBotPanel.update(null);
++  }
++}
++
++async function syncBotCommandSettings(): Promise<void> {
++  try {
++    botCommandSettings = await window.wowminAPI.bots.getCommandSettings();
++  } catch (error) {
++    console.warn('[bot commands] Could not read the setting.', error);
++  }
++  refreshBotCommandPanels();
++}
++
++$mapBotCommands?.addEventListener('change', async () => {
++  if (!$mapBotCommands) return;
++  const requested = $mapBotCommands.checked;
++  $mapBotCommands.disabled = true;
++  try {
++    botCommandSettings = await window.wowminAPI.bots.setCommandEnabled(requested);
++  } catch (error) {
++    console.warn('[bot commands] Could not change the setting.', error);
++  } finally {
++    $mapBotCommands.disabled = false;
++    refreshBotCommandPanels();
++  }
++});
++
+ // ── Canvas click → player selection ──────────────────────────────────────
+ $mapCanvas?.addEventListener('click', (e) => {
+   if (mapSuppressClick) {
+@@ -8803,6 +8887,13 @@ function renderInstanceBotCard(session: ActiveInstanceSession | null, now: numbe
+   if (!$instanceBotCard || !$instanceBotDecisions) return;
+   instanceBotCardRenderedAt = now;
+   const live = Boolean(session && instanceLiveStream?.key === session.key);
++  const selected = session?.players.find((player) => player.name === selectedInstancePlayerName);
++  instanceBotPanel.update(botCommandTarget(
++    selected,
++    session?.players ?? [],
++    selected && live ? instanceLiveBots.get(selected.name, now) : null,
++    live ? 'No live data for this bot yet.' : 'Bot decisions require the live stream.',
++  ), now);
+   const bots = live && instanceShowDecisions && session
+     ? session.players.flatMap((player) => {
+       const decision = player.isBot ? instanceLiveBots.get(player.name, now) : null;
+@@ -9211,6 +9302,9 @@ for (const control of document.querySelectorAll<HTMLElement>('.instance-3d-contr
+   control.classList.toggle('hidden', !instanceView3d);
+ }
+ 
++const instanceBotPanel = createBotCommandPanel(
++  $<HTMLElement>('instance-bot-commands'), 'bot-cmd-card', 'wowmin.botCommands.instance.collapsed');
++
+ async function syncSessionRecordingToggle(): Promise<void> {
+   if (!$instanceRecordSessions) return;
+   $instanceRecordSessions.disabled = true;
+@@ -9237,6 +9331,7 @@ $instanceRecordSessions?.addEventListener('change', async () => {
+   }
+ });
+ void syncSessionRecordingToggle();
++void syncBotCommandSettings();
+ $instanceFollowBtn?.setAttribute('aria-pressed', String(instanceFollowSelected));
+ $instanceFollowBtn?.addEventListener('click', () => setInstanceFollowSelected(!instanceFollowSelected));
+ $instancePathsBtn?.setAttribute('aria-pressed', String(instanceShowPaths));
+@@ -9871,9 +9966,23 @@ const world3dLive = {
+   gameObjects: new LiveGameObjectStore(),
+   auras: new LiveAuraStore(),
+   effects: new CombatEffectStore(),
++  bots: new LiveBotStore(),
+ };
+ let world3dStream: { key: string; stop: () => void; status: StreamStatus } | null = null;
+ 
++// The followed bot's command panel, updated a few times a second.
++const WORLD3D_BOT_PANEL_MS = 250;
++const world3dBotPanel = createBotCommandPanel($world3dPanel, 'bot-cmd-world3d', 'wowmin.botCommands.world3d.collapsed');
++let world3dBotPanelAt = 0;
++
++function updateWorld3dBotCommands(player: MapPlayerPosition | null, now: number): void {
++  if (now - world3dBotPanelAt < WORLD3D_BOT_PANEL_MS) return;
++  world3dBotPanelAt = now;
++  const decision = player ? world3dLive.bots.get(player.name, now) : null;
++  const noLiveData = world3dStream?.status === 'streaming' ? 'No live data for this bot yet.' : 'Waiting for the live stream.';
++  world3dBotPanel.update(botCommandTarget(player, mapAllPlayers, decision, noLiveData), now);
++}
++
+ function getWorld3dSceneView(): InstanceSceneView | null {
+   if (world3dSceneView === undefined) {
+     world3dSceneView = $world3dScene && InstanceSceneView.isSupported()
+@@ -9929,6 +10038,7 @@ function closeWorld3d(): void {
+   world3dTrails.clear();
+   world3dName = null;
+   syncWorld3dStream(null);
++  world3dBotPanel.update(null);
+   if (world3dPoll) { clearInterval(world3dPoll); world3dPoll = null; }
+   if (world3dFrame !== null) { cancelAnimationFrame(world3dFrame); world3dFrame = null; }
+   if ($world3dPanel) $world3dPanel.hidden = true;
+@@ -10024,6 +10134,7 @@ function syncWorld3dStream(player: MapPlayerPosition | null): void {
+     onGameObjects: (update) => { if (current()) world3dLive.gameObjects.push(update, performance.now()); },
+     onUnitAuras: (update) => { if (current()) world3dLive.auras.push(update, performance.now()); },
+     onCombatEvents: (update) => { if (current()) world3dLive.effects.push(update, performance.now()); },
++    onBots: (update) => { if (current()) world3dLive.bots.push(update, performance.now()); },
+   }, { name: player.name, radius: world3dStreamRadius });
+   world3dStream = stream;
+ }
+@@ -10043,6 +10154,7 @@ function renderWorld3d(): void {
+ 
+   const player = mapAllPlayers.find((candidate) => candidate.name === world3dName) ?? null;
+   syncWorld3dStream(player);
++  updateWorld3dBotCommands(player, performance.now());
+   if (!player) {
+     if ($world3dStatus) $world3dStatus.textContent = world3dAway ?? `Looking for ${world3dName}…`;
+     return;
+diff --git a/renderer/scripts/types/wowmin-api.ts b/renderer/scripts/types/wowmin-api.ts
+index 8621cfc..864ea85 100644
+--- a/renderer/scripts/types/wowmin-api.ts
++++ b/renderer/scripts/types/wowmin-api.ts
+@@ -1,5 +1,8 @@
+ import type {
+   BackendConnectionStatus,
++  BotCommandResult,
++  BotCommandSettings,
++  BotCommandSource,
+   CharacterInventoryResult,
+   ConnectionProfile,
+   DbConfig,
+@@ -86,6 +89,11 @@ export interface WowminAPI {
+     setRecordingEnabled(enabled: boolean): Promise<boolean>;
+     purgeCompleted(): Promise<number>;
+   };
++  bots: {
++    command(bot: string, command: string, source: BotCommandSource): Promise<BotCommandResult>;
++    getCommandSettings(): Promise<BotCommandSettings>;
++    setCommandEnabled(enabled: boolean): Promise<BotCommandSettings>;
++  };
+   economy: {
+     connect(config: DbConfig): Promise<DbConnectionState>;
+     disconnect(): Promise<void>;
+diff --git a/renderer/scripts/utils/bot-command-panel.ts b/renderer/scripts/utils/bot-command-panel.ts
+new file mode 100644
+index 0000000..3aed000
+--- /dev/null
++++ b/renderer/scripts/utils/bot-command-panel.ts
+@@ -0,0 +1,275 @@
++import type { BotCommandResult, BotCommandSource } from '../../../src/types/api';
++import {
++  BOT_MASTER_COMMANDS, BOT_PANEL_STRATEGIES, BOT_SELF_COMMANDS,
++  botStrategyPrefix, diffBotStrategies, expectedStrategyChange, normalizeBotCommand,
++} from '../../../src/bot-command-rules';
++
++// Bot control: the owner's command panel for one bot. Built once and
++// updated in place, so a redraw never loses typing or an open list; the module
++// ("wowmin botcmd") is the real check, this only greys out what it refuses.
++
++export interface BotCommandTarget {
++  name: string;
++  // Bot in a group with the owner's character: the master buttons show.
++  masterAllowed: boolean;
++  // The bot's WMB1 sample from an open stream, or null without one.
++  decision: { state: string; strategies: string[] } | null;
++  // Why there is no live data, shown in place of the chips.
++  noLiveData: string;
++}
++
++export type BotCommandSend = (bot: string, command: string, source: BotCommandSource) => Promise<BotCommandResult>;
++
++// A change WMB1 shows is highlighted this long.
++const CHANGED_MS = 4000;
++// A sent strategy change not seen in WMB1 within this long is reported.
++const EXPECT_MS = 5000;
++
++const SELF_LABELS: Record<string, string> = {
++  stay: 'Stay', grind: 'Grind', flee: 'Flee', 'reset botAI': 'Reset AI', release: 'Release',
++};
++const MASTER_LABELS: Record<string, string> = {
++  follow: 'Follow', summon: 'Summon', attack: 'Attack', 'tank attack': 'Tank attack',
++};
++
++function element<K extends keyof HTMLElementTagNameMap>(tag: K, className: string, text = ''): HTMLElementTagNameMap[K] {
++  const node = document.createElement(tag);
++  node.className = className;
++  if (text) node.textContent = text;
++  return node;
++}
++
++export class BotCommandPanel {
++  readonly root: HTMLElement;
++  private readonly title: HTMLElement;
++  private readonly body: HTMLElement;
++  private readonly masterRow: HTMLElement;
++  private readonly chips: HTMLElement;
++  private readonly addSelect: HTMLSelectElement;
++  private readonly input: HTMLInputElement;
++  private readonly sendButton: HTMLButtonElement;
++  private readonly reply: HTMLElement;
++  private target: BotCommandTarget | null = null;
++  private busy = false;
++  private chipsKey = '';
++  private addPrefix: 'co' | 'nc' | null | undefined;
++  private lastStrategies: { name: string; strategies: string[] } | null = null;
++  private changed = new Map<string, number>();
++  private expected: { name: string; prefix: 'co' | 'nc'; strategy: string; adding: boolean; at: number } | null = null;
++
++  constructor(
++    private readonly send: BotCommandSend,
++    private readonly onResult: (bot: string, command: string, result: BotCommandResult) => void = () => {},
++    private readonly storageKey: string | null = null,
++  ) {
++    this.root = element('div', 'bot-cmd hidden');
++    const head = element('div', 'bot-cmd-head');
++    this.title = element('span', 'bot-cmd-title', 'Commands');
++    const collapse = element('button', 'btn btn-tiny bot-cmd-collapse', '–');
++    collapse.type = 'button';
++    collapse.title = 'Hide or show the commands';
++    head.append(this.title, collapse);
++    this.body = element('div', 'bot-cmd-body');
++
++    const selfRow = element('div', 'bot-cmd-row');
++    for (const [, command] of BOT_SELF_COMMANDS) selfRow.append(this.commandButton(command, SELF_LABELS[command] ?? command));
++    this.masterRow = element('div', 'bot-cmd-row bot-cmd-master');
++    this.masterRow.title = 'For a bot in your group';
++    for (const command of BOT_MASTER_COMMANDS) this.masterRow.append(this.commandButton(command, MASTER_LABELS[command] ?? command));
++
++    const strategyRow = element('div', 'bot-cmd-strategies');
++    this.chips = element('div', 'bot-cmd-chips');
++    this.addSelect = element('select', 'bot-cmd-add');
++    this.addSelect.title = 'Add a strategy';
++    strategyRow.append(this.chips, this.addSelect);
++
++    const form = element('form', 'bot-cmd-text');
++    this.input = element('input', 'bot-cmd-input');
++    this.input.maxLength = 60;
++    this.input.placeholder = 'One command, e.g. nc +food';
++    this.input.spellcheck = false;
++    this.sendButton = element('button', 'btn btn-tiny', 'Send');
++    this.sendButton.type = 'submit';
++    form.append(this.input, this.sendButton);
++    this.reply = element('div', 'action-result bot-cmd-reply');
++    this.body.append(selfRow, this.masterRow, strategyRow, form, this.reply);
++    this.root.append(head, this.body);
++
++    this.setCollapsed(this.readCollapsed());
++    collapse.addEventListener('click', () => this.setCollapsed(!this.root.classList.contains('collapsed')));
++    this.body.addEventListener('click', (event) => {
++      const button = (event.target as HTMLElement).closest<HTMLButtonElement>('[data-bot-cmd]');
++      if (button && !button.disabled) void this.run(button.dataset.botCmd ?? '', 'button');
++    });
++    this.addSelect.addEventListener('change', () => {
++      const command = this.addSelect.value;
++      this.addSelect.value = '';
++      if (command) void this.run(command, 'button');
++    });
++    this.input.addEventListener('input', () => this.syncInput());
++    form.addEventListener('submit', (event) => {
++      event.preventDefault();
++      if (!this.sendButton.disabled) void this.run(this.input.value, 'text', true);
++    });
++  }
++
++  // null hides the panel.
++  update(target: BotCommandTarget | null, now = performance.now()): void {
++    if (target?.name !== this.target?.name) {
++      this.reply.textContent = '';
++      this.reply.className = 'action-result bot-cmd-reply';
++      this.expected = null;
++      this.changed.clear();
++      this.lastStrategies = null;
++      this.chipsKey = '';
++    }
++    this.target = target;
++    this.root.classList.toggle('hidden', !target);
++    if (!target) return;
++    this.title.textContent = `Commands · ${target.name}`;
++    this.masterRow.hidden = !target.masterAllowed;
++    this.renderStrategies(target, now);
++    this.syncInput();
++  }
++
++  private commandButton(command: string, label: string): HTMLButtonElement {
++    const button = element('button', 'btn btn-tiny', label);
++    button.type = 'button';
++    button.dataset.botCmd = command;
++    button.title = command;
++    return button;
++  }
++
++  private renderStrategies(target: BotCommandTarget, now: number): void {
++    const decision = target.decision;
++    const prefix = botStrategyPrefix(decision?.state);
++    if (decision) {
++      const previous = this.lastStrategies?.name === target.name ? this.lastStrategies.strategies : null;
++      if (previous) {
++        const { added, removed } = diffBotStrategies(previous, decision.strategies);
++        for (const name of [...added, ...removed]) this.changed.set(name, now);
++      }
++      this.lastStrategies = { name: target.name, strategies: decision.strategies };
++      this.checkExpected(target.name, prefix, decision.strategies, now);
++    }
++    for (const [name, at] of this.changed) if (now - at > CHANGED_MS) this.changed.delete(name);
++
++    const key = decision
++      ? `${prefix}|${decision.strategies.join(',')}|${[...this.changed.keys()].sort().join(',')}`
++      : `none|${target.noLiveData}`;
++    if (key !== this.chipsKey) {
++      this.chipsKey = key;
++      this.chips.replaceChildren();
++      if (!decision) {
++        this.chips.append(element('span', 'bot-cmd-hint', target.noLiveData));
++      } else {
++        const label = prefix === 'co' ? 'In combat' : prefix === 'nc' ? 'Out of combat' : 'While dead';
++        this.chips.append(element('span', 'bot-cmd-hint', `${label}:`));
++        for (const strategy of decision.strategies) {
++          const chip = element('button', `bot-cmd-chip${this.changed.has(strategy) ? ' changed' : ''}`, strategy);
++          chip.type = 'button';
++          if (prefix && normalizeBotCommand(`${prefix} -${strategy}`)) {
++            chip.dataset.botCmd = `${prefix} -${strategy}`;
++            chip.title = `Remove (${prefix} -${strategy})`;
++          } else {
++            chip.disabled = true;
++          }
++          this.chips.append(chip);
++        }
++        if (!decision.strategies.length) this.chips.append(element('span', 'bot-cmd-hint', 'none'));
++      }
++    }
++
++    if (prefix !== this.addPrefix) {
++      this.addPrefix = prefix;
++      const options = prefix ? BOT_PANEL_STRATEGIES[prefix] : [];
++      this.addSelect.replaceChildren(new Option('+', ''), ...options.map((name) => new Option(name, `${prefix} +${name}`)));
++    }
++    const active = new Set(decision?.strategies ?? []);
++    for (const option of Array.from(this.addSelect.options).slice(1)) option.disabled = active.has(option.text);
++    this.addSelect.hidden = !prefix;
++  }
++
++  private checkExpected(name: string, prefix: 'co' | 'nc' | null, strategies: string[], now: number): void {
++    const expected = this.expected;
++    if (!expected || expected.name !== name) return;
++    if (expected.prefix === prefix && strategies.includes(expected.strategy) === expected.adding) {
++      this.expected = null;
++      this.changed.set(expected.strategy, now);
++      this.showReply(true, `${this.reply.textContent} · seen in live data`);
++    } else if (now - expected.at > EXPECT_MS) {
++      this.expected = null;
++      this.showReply(true, `${this.reply.textContent} · not seen in live data yet (the bot may be in the other state, or the random bot manager changed it back)`);
++    }
++  }
++
++  private syncInput(): void {
++    const disabled = this.busy || !this.target;
++    for (const button of Array.from(this.body.querySelectorAll<HTMLButtonElement>('.bot-cmd-row [data-bot-cmd]'))) button.disabled = disabled;
++    this.addSelect.disabled = disabled;
++    const text = this.input.value.trim();
++    const allowed = Boolean(text) && Boolean(normalizeBotCommand(text));
++    this.sendButton.disabled = disabled || !allowed;
++    this.input.classList.toggle('refused', Boolean(text) && !allowed);
++    this.input.title = text && !allowed ? 'Not on the allowlist' : '';
++  }
++
++  private async run(command: string, source: BotCommandSource, fromInput = false): Promise<void> {
++    const target = this.target;
++    if (!target || this.busy) return;
++    this.busy = true;
++    this.syncInput();
++    let result: BotCommandResult;
++    try {
++      result = await this.send(target.name, command.trim(), source);
++    } catch (error) {
++      result = { success: false, status: 'error', reply: error instanceof Error ? error.message : String(error) };
++    }
++    this.busy = false;
++    if (this.target?.name === target.name) {
++      if (result.success && fromInput) this.input.value = '';
++      this.showReply(result.success, describeBotCommandResult(result));
++      const change = result.success && result.command ? expectedStrategyChange(result.command) : null;
++      this.expected = change
++        ? { name: target.name, prefix: change.prefix, strategy: change.name, adding: change.adding, at: performance.now() }
++        : null;
++    }
++    this.syncInput();
++    this.onResult(target.name, command.trim(), result);
++  }
++
++  private showReply(ok: boolean, text: string): void {
++    this.reply.textContent = text;
++    this.reply.className = `action-result bot-cmd-reply visible ${ok ? 'ok' : 'err'}`;
++  }
++
++  private readCollapsed(): boolean {
++    if (!this.storageKey) return false;
++    try {
++      return localStorage.getItem(this.storageKey) === '1';
++    } catch {
++      return false;
++    }
++  }
++
++  private setCollapsed(collapsed: boolean): void {
++    this.root.classList.toggle('collapsed', collapsed);
++    if (!this.storageKey) return;
++    try {
++      localStorage.setItem(this.storageKey, collapsed ? '1' : '0');
++    } catch {
++      // Remembering is a convenience only.
++    }
++  }
++}
++
++export function describeBotCommandResult(result: BotCommandResult): string {
++  switch (result.status) {
++    case 'ok': return `ok: ${result.command ?? ''}`;
++    case 'refused': return `refused: ${result.reason ?? ''}`;
++    case 'disabled': return result.reason
++      ? `off: ${result.reason}`
++      : 'off: WowMinTelemetry.BotCommand.Enable = 0 on the server';
++    default: return `error: ${result.reply || 'no reply'}`;
++  }
++}
+diff --git a/renderer/scripts/web-api.ts b/renderer/scripts/web-api.ts
+index 4410658..842ffd6 100644
+--- a/renderer/scripts/web-api.ts
++++ b/renderer/scripts/web-api.ts
+@@ -101,6 +101,11 @@ const wowminAPI: WowminAPI = {
+     setRecordingEnabled: (enabled) => invoke('sessions:setRecordingEnabled', enabled),
+     purgeCompleted: () => invoke('sessions:purgeCompleted'),
+   },
++  bots: {
++    command: (bot, command, source) => invoke('bots:command', bot, command, source),
++    getCommandSettings: () => invoke('bots:getCommandSettings'),
++    setCommandEnabled: (enabled) => invoke('bots:setCommandEnabled', enabled),
++  },
+   economy: {
+     connect: (config) => invoke('economy:connect', config),
+     disconnect: () => invoke('economy:disconnect'),
+diff --git a/renderer/styles.css b/renderer/styles.css
+index bc66fe8..0ec44f2 100644
+--- a/renderer/styles.css
++++ b/renderer/styles.css
+@@ -4209,3 +4209,50 @@ tbody tr:hover { background: var(--tint-accent-05); }
+     grid-template-columns: minmax(0, 1fr);
+   }
+ }
++
++/* Bot commands: one panel on the Live Map, in World 3D
++   and in Instance Watch. */
++.bot-cmd {
++  display: flex;
++  flex-direction: column;
++  gap: 6px;
++  width: 320px;
++  max-width: calc(100% - 20px);
++  padding: 8px 10px;
++  border: 1px solid var(--border);
++  border-radius: var(--radius);
++  background: var(--bg-card);
++  font-size: 12px;
++}
++.bot-cmd.hidden { display: none; }
++.bot-cmd-map { position: absolute; z-index: 6; right: 10px; bottom: 90px; }
++.bot-cmd-world3d { position: absolute; z-index: 2; top: 48px; right: 10px; background: rgba(8, 17, 29, 0.88); }
++.bot-cmd-card { width: auto; max-width: none; margin-top: 10px; }
++.bot-cmd-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
++.bot-cmd-title { font-weight: bold; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
++.bot-cmd.collapsed .bot-cmd-body { display: none; }
++.bot-cmd-body { display: flex; flex-direction: column; gap: 6px; }
++.bot-cmd-row { display: flex; flex-wrap: wrap; gap: 4px; }
++.bot-cmd-row[hidden] { display: none; }
++.bot-cmd-master .btn { border-color: var(--yellow); }
++.bot-cmd-strategies { display: flex; align-items: flex-start; gap: 6px; }
++.bot-cmd-chips { display: flex; flex: 1; flex-wrap: wrap; gap: 3px; min-width: 0; }
++.bot-cmd-chip {
++  padding: 1px 6px;
++  border: 1px solid transparent;
++  border-radius: 3px;
++  background: var(--bg-input);
++  color: var(--text-muted);
++  font-size: 10px;
++  cursor: pointer;
++}
++.bot-cmd-chip:hover:not(:disabled) { border-color: var(--color-danger); color: var(--text); text-decoration: line-through; }
++.bot-cmd-chip:disabled { cursor: default; }
++.bot-cmd-chip.changed { border-color: var(--yellow); color: var(--yellow); }
++.bot-cmd-hint { color: var(--text-muted); font-size: 10px; }
++.bot-cmd-add { flex-shrink: 0; max-width: 90px; font-size: 11px; }
++.bot-cmd-add[hidden] { display: none; }
++.bot-cmd-text { display: flex; gap: 4px; }
++.bot-cmd-input { flex: 1; min-width: 0; font-family: var(--font-mono); font-size: 11px; }
++.bot-cmd-input.refused { border-color: var(--color-danger); }
++.bot-cmd-reply { margin-top: 0; padding: 4px 8px; font-size: 11px; }
+diff --git a/scripts/test-bot-command.cjs b/scripts/test-bot-command.cjs
+index 22968f1..4b37d4c 100644
+--- a/scripts/test-bot-command.cjs
++++ b/scripts/test-bot-command.cjs
+@@ -21,7 +21,8 @@ new Function('module', 'exports', 'require', '__dirname', '__filename', output)(
+   __filename,
+ );
+ const {
+-  BotCommandSender, buildBotCommandLine, normalizeBotCommand, parseBotCommandReply, parseBotName,
++  BotCommandSender, botStrategyPrefix, buildBotCommandLine, canUseMasterCommands, diffBotStrategies,
++  expectedStrategyChange, normalizeBotCommand, parseBotCommandReply, parseBotName, BOT_PANEL_STRATEGIES,
+ } = moduleValue.exports;
+ 
+ const plain = (value) => JSON.parse(JSON.stringify(value));
+@@ -88,16 +89,18 @@ test('the console line and the module replies', () => {
+ async function senderFixture(replies) {
+   const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), 'wowmin-botcmd-'));
+   const sent = [];
+-  const sender = new BotCommandSender(
+-    path.join(dataDir, 'data'),
+-    async (command) => {
++  const sender = new BotCommandSender({
++    dataDir: path.join(dataDir, 'data'),
++    execute: async (command) => {
+       sent.push(command);
+       const reply = replies.shift();
+       if (reply instanceof Error) throw reply;
+       return reply;
+     },
+-    () => Date.UTC(2026, 9, 21, 12, 0, 0),
+-  );
++    ownerAccountId: 101,
++    now: () => Date.UTC(2026, 9, 21, 12, 0, 0),
++  });
++  await sender.setEnabled(true);
+   const readLog = async () => (await fs.readFile(path.join(dataDir, 'data', 'bot-commands.jsonl'), 'utf8'))
+     .trim().split('\n').map((line) => JSON.parse(line));
+   return { dataDir, sent, sender, readLog };
+@@ -154,3 +157,60 @@ test('the sender refuses a bad name or command without reaching the server', asy
+     await fs.rm(dataDir, { recursive: true, force: true });
+   }
+ });
++
++test('the WoWMin off switch: off until turned on, kept in the data dir, refuses sends', async () => {
++  const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), 'wowmin-botcmd-'));
++  const sent = [];
++  const make = () => new BotCommandSender({
++    dataDir,
++    execute: async (command) => { sent.push(command); return { success: true, message: 'WBOTCMD|ok|Tulli|stay' }; },
++    ownerAccountId: 'x',
++  });
++  try {
++    const sender = make();
++    assert.deepEqual(plain(await sender.getSettings()), { enabled: false, ownerAccountId: 0 });
++    assert.deepEqual(plain(await sender.send('Tulli', 'stay', 'button')), {
++      success: false, status: 'disabled', reply: '', reason: 'turned off in WoWMin',
++    });
++    assert.deepEqual(sent, []);
++    assert.equal((await sender.setEnabled(true)).enabled, true);
++    // A restarted WoWMin reads the setting back.
++    const restarted = make();
++    assert.equal((await restarted.getSettings()).enabled, true);
++    assert.equal((await restarted.send('Tulli', 'stay', 'button')).status, 'ok');
++    await restarted.setEnabled(false);
++    assert.equal((await make().getSettings()).enabled, false);
++  } finally {
++    await fs.rm(dataDir, { recursive: true, force: true });
++  }
++});
++
++test('panel helpers: strategy prefix, add list, master buttons, changes', () => {
++  assert.equal(botStrategyPrefix('combat'), 'co');
++  assert.equal(botStrategyPrefix('idle'), 'nc');
++  assert.equal(botStrategyPrefix('dead'), null);
++  assert.equal(botStrategyPrefix(undefined), null);
++  // Every name the "+" list offers passes the allowlist mirror.
++  for (const prefix of ['co', 'nc']) {
++    for (const name of BOT_PANEL_STRATEGIES[prefix]) {
++      assert.deepEqual(plain(normalizeBotCommand(`${prefix} +${name}`)), { kind: 'strategy', command: `${prefix} +${name}` });
++    }
++  }
++
++  const bot = { isBot: true, accountId: 5, groupId: 7 };
++  const owner = { isBot: false, accountId: 101, groupId: 7 };
++  const stranger = { isBot: false, accountId: 33, groupId: 7 };
++  assert.equal(canUseMasterCommands(bot, [bot, owner], 101), true);
++  assert.equal(canUseMasterCommands(bot, [bot, stranger], 101), false);
++  assert.equal(canUseMasterCommands(bot, [bot, { ...owner, groupId: 8 }], 101), false);
++  assert.equal(canUseMasterCommands({ ...bot, groupId: 0 }, [owner], 101), false);
++  assert.equal(canUseMasterCommands({ ...bot, isBot: false }, [owner], 101), false);
++  // Without an owner account, any real player in the group.
++  assert.equal(canUseMasterCommands(bot, [bot, stranger], 0), true);
++  assert.equal(canUseMasterCommands(bot, [bot, { ...bot, accountId: 6 }], 0), false);
++
++  assert.deepEqual(plain(diffBotStrategies(['food', 'loot'], ['loot', 'rpg'])), { added: ['rpg'], removed: ['food'] });
++  assert.deepEqual(plain(expectedStrategyChange('nc -food')), { prefix: 'nc', name: 'food', adding: false });
++  assert.deepEqual(plain(expectedStrategyChange('co +avoid aoe')), { prefix: 'co', name: 'avoid aoe', adding: true });
++  assert.equal(expectedStrategyChange('stay'), null);
++});
+diff --git a/src/api-backend.ts b/src/api-backend.ts
+index 5970983..c875cb0 100644
+--- a/src/api-backend.ts
++++ b/src/api-backend.ts
+@@ -4,7 +4,7 @@ import packageJson from '../package.json';
+ import { SoapClient } from './soap-client';
+ import { ConfigStore } from './config-store';
+ import { getDbService, DatabaseService } from './database/db-service';
+-import { SoapConfig, SoapResult, ConnectionProfile, DbConfig, DbConnectionState, QueryResult, FieldInfo, EntityMediaPreviewRequest, EntityMediaPreviewResult, LogMonitorConfig, LogMonitorInspectionResult, LogMonitorFileTailResult, MapPlayerPosition, MapPlayerSnapshot, MapOnlineCounts, OnlinePlayerRow, MapBotWaypointRequest, MapBotWaypoint, CharacterInventoryResult, CharacterInventoryItemRow, EconomyOverview, EconomyCharacterGoldResult, EconomyAuctionRow, EconomyMarketSummaryRow, SessionIndexEntry, SessionRecord, BotCommandResult, BotCommandSource, BackendConnectionStatus, ManagedServiceName, CreatureInfo } from './types/api';
++import { SoapConfig, SoapResult, ConnectionProfile, DbConfig, DbConnectionState, QueryResult, FieldInfo, EntityMediaPreviewRequest, EntityMediaPreviewResult, LogMonitorConfig, LogMonitorInspectionResult, LogMonitorFileTailResult, MapPlayerPosition, MapPlayerSnapshot, MapOnlineCounts, OnlinePlayerRow, MapBotWaypointRequest, MapBotWaypoint, CharacterInventoryResult, CharacterInventoryItemRow, EconomyOverview, EconomyCharacterGoldResult, EconomyAuctionRow, EconomyMarketSummaryRow, SessionIndexEntry, SessionRecord, BotCommandResult, BotCommandSettings, BotCommandSource, BackendConnectionStatus, ManagedServiceName, CreatureInfo } from './types/api';
+ import { ManagedConnectionLifecycle } from './managed-connection-lifecycle';
+ import { inspectRemoteLogs, readRemoteLogTail } from './log-monitor-service';
+ import { buildLiveMapTelemetryCommand, parseLiveMapTelemetrySnapshot } from './live-map-telemetry';
+@@ -45,12 +45,13 @@ export const telemetryStream = new TelemetryStream(
+   Number(process.env.WOWMIN_STREAM_PORT) || 7979,
+ );
+ // Bot control: owner-only playerbot commands, logged to bot-commands.jsonl.
+-const botCommandSender = new BotCommandSender(
+-  process.env.WOWMIN_DATA_DIR || DEFAULT_DATA_DIR,
+-  (command) => soapClient
++const botCommandSender = new BotCommandSender({
++  dataDir: process.env.WOWMIN_DATA_DIR || DEFAULT_DATA_DIR,
++  execute: (command) => soapClient
+     ? soapClient.executeCommand(command)
+     : Promise.resolve({ success: false, message: 'Not connected to the worldserver.' }),
+-);
++  ownerAccountId: Number(process.env.WOWMIN_BOT_OWNER_ACCOUNT) || 0,
++});
+ 
+ export interface ManagedBackendConfig {
+   soap: SoapConfig;
+@@ -1175,6 +1176,11 @@ apiRouter.handle('sessions:purgeCompleted', async (): Promise<number> => session
+ apiRouter.handle('bots:command', async (_event, bot: string, command: string, source?: BotCommandSource): Promise<BotCommandResult> =>
+   botCommandSender.send(bot, command, source));
+ 
++apiRouter.handle('bots:getCommandSettings', async (): Promise<BotCommandSettings> => botCommandSender.getSettings());
++
++apiRouter.handle('bots:setCommandEnabled', async (_event, enabled: boolean): Promise<BotCommandSettings> =>
++  botCommandSender.setEnabled(enabled === true));
++
+ // Names, levels, and ranks for creatures in the live stream, by entry.
+ apiRouter.handle('map:getCreatureInfo', async (_event, entries: unknown): Promise<CreatureInfo[]> => {
+   const ids = [...new Set((Array.isArray(entries) ? entries : []).map(Number))]
+diff --git a/src/bot-command-rules.ts b/src/bot-command-rules.ts
+new file mode 100644
+index 0000000..f810f49
+--- /dev/null
++++ b/src/bot-command-rules.ts
+@@ -0,0 +1,118 @@
++import type { BotCommandKind, BotCommandResult, BotCommandSource } from './types/api';
++
++// Bot control: one playerbot command sent through mod-wowmin-telemetry's
++// "wowmin botcmd". The module's allowlist (NormalizeBotCommand in
++// WowMinTelemetry.cpp) is the real check; this mirror only lets the UI grey out
++// and skip what the server would refuse.
++
++export const BOT_SELF_COMMANDS: ReadonlyArray<readonly [string, string]> = [
++  ['stay', 'stay'],
++  ['grind', 'grind'],
++  ['flee', 'flee'],
++  ['reset botai', 'reset botAI'],
++  ['release', 'release'],
++];
++// Master commands act for the bot's master, who must be on the owner's account.
++export const BOT_MASTER_COMMANDS: ReadonlyArray<string> = ['follow', 'summon', 'attack', 'tank attack'];
++export const BOT_COMMAND_SOURCES: ReadonlyArray<BotCommandSource> = ['button', 'text', 'suggestion'];
++
++export interface NormalizedBotCommand {
++  kind: BotCommandKind;
++  command: string;
++}
++
++// A bot's name from untrusted input (it goes into a console command): letters
++// only, 2-12, as parseStreamFollow.
++export function parseBotName(name: unknown): string | null {
++  return typeof name === 'string' && /^\p{L}{2,12}$/u.test(name) ? name : null;
++}
++
++// The command as the module sends it to playerbots, or null when the module
++// would answer "not allowed". Words are rejoined with single spaces, as the
++// module reads them.
++export function normalizeBotCommand(text: unknown): NormalizedBotCommand | null {
++  if (typeof text !== 'string') return null;
++  const joined = text.split(/\s+/).filter(Boolean).join(' ');
++  // Letters, digits, spaces, + and - only: no command separators.
++  if (!/^[A-Za-z0-9 +-]+$/.test(joined)) return null;
++  const lower = joined.toLowerCase();
++
++  for (const [name, sent] of BOT_SELF_COMMANDS) {
++    if (lower === name) return { kind: 'self', command: sent };
++  }
++  if (BOT_MASTER_COMMANDS.includes(lower)) return { kind: 'master', command: lower };
++
++  // "co +<s>", "co -<s>", "nc +<s>", "nc -<s>": one strategy at a time. The
++  // module also checks the name against the bot's supported strategies.
++  if (lower.length > 4 && /^(co|nc) [+-]/.test(lower)) {
++    const name = lower.slice(4);
++    if (name.startsWith(' ') || /[+-]/.test(name)) return null;
++    return { kind: 'strategy', command: lower };
++  }
++  return null;
++}
++
++export function buildBotCommandLine(bot: string, command: string): string {
++  return `wowmin botcmd ${bot} ${command}`;
++}
++
++// The module's reply: "WBOTCMD|ok|<bot>|<command>", "WBOTCMD|refused|<reason>"
++// or "WBOTCMD|disabled". Anything else is an error.
++export function parseBotCommandReply(message: string): BotCommandResult {
++  const reply = message.split(/[\r\n]+/).map((line) => line.trim()).find((line) => line.startsWith('WBOTCMD|'));
++  if (!reply) return { success: false, status: 'error', reply: message.trim() };
++  const [, status, ...rest] = reply.split('|');
++  if (status === 'ok' && rest.length >= 2) {
++    return { success: true, status: 'ok', reply, bot: rest[0], command: rest.slice(1).join('|') };
++  }
++  if (status === 'refused') return { success: false, status: 'refused', reply, reason: rest.join('|') };
++  if (status === 'disabled') return { success: false, status: 'disabled', reply };
++  return { success: false, status: 'error', reply };
++}
++
++// ── Command panel helpers (renderer) ──────────────────────────────────────
++
++// Strategy names offered by the panel's "+" list, checked against
++// mod-playerbots StrategyContext.h (037c01418b5d); behaviour only. The text box takes
++// any other name the module allows.
++export const BOT_PANEL_STRATEGIES: Readonly<Record<'co' | 'nc', ReadonlyArray<string>>> = {
++  co: ['aoe', 'avoid aoe', 'behind', 'close', 'kite', 'potions', 'ranged', 'threat'],
++  nc: ['food', 'gather', 'grind', 'loot', 'mount', 'quest', 'rpg', 'sit'],
++};
++
++// WMB1 sends the strategies of the bot's current state: combat ones in combat
++// ("co"), the others when idle ("nc"). A dead bot's cannot be changed here.
++export function botStrategyPrefix(state: string | null | undefined): 'co' | 'nc' | null {
++  if (state === 'combat') return 'co';
++  if (state === 'idle') return 'nc';
++  return null;
++}
++
++export interface BotGroupMember {
++  isBot: boolean;
++  accountId: number;
++  groupId?: number;
++}
++
++// Master commands need the bot in a group with the owner's character online.
++// Without an owner account set, any real player in the group counts; the
++// module still checks its own OwnerAccount.
++export function canUseMasterCommands(bot: BotGroupMember, players: ReadonlyArray<BotGroupMember>, ownerAccountId: number): boolean {
++  if (!bot.isBot || !bot.groupId) return false;
++  return players.some((player) => !player.isBot && player.groupId === bot.groupId
++    && (!ownerAccountId || player.accountId === ownerAccountId));
++}
++
++// What changed between two strategy samples of one bot.
++export function diffBotStrategies(before: ReadonlyArray<string>, after: ReadonlyArray<string>): { added: string[]; removed: string[] } {
++  return {
++    added: after.filter((strategy) => !before.includes(strategy)),
++    removed: before.filter((strategy) => !after.includes(strategy)),
++  };
++}
++
++// The strategy a sent "co +x" / "nc -x" expects to see, or null.
++export function expectedStrategyChange(command: string): { prefix: 'co' | 'nc'; name: string; adding: boolean } | null {
++  const match = /^(co|nc) ([+-])(.+)$/.exec(command);
++  return match ? { prefix: match[1] as 'co' | 'nc', name: match[3], adding: match[2] === '+' } : null;
++}
+diff --git a/src/bot-command.ts b/src/bot-command.ts
+index 556ad16..4e2b18a 100644
+--- a/src/bot-command.ts
++++ b/src/bot-command.ts
+@@ -1,76 +1,9 @@
+ import * as fs from 'fs/promises';
+ import * as path from 'path';
+-import type { BotCommandKind, BotCommandResult, BotCommandSource } from './types/api';
++import type { BotCommandResult, BotCommandSettings, BotCommandSource } from './types/api';
++import { BOT_COMMAND_SOURCES, buildBotCommandLine, normalizeBotCommand, parseBotCommandReply, parseBotName } from './bot-command-rules';
+ 
+-// Bot control: one playerbot command sent through mod-wowmin-telemetry's
+-// "wowmin botcmd". The module's allowlist (NormalizeBotCommand in
+-// WowMinTelemetry.cpp) is the real check; this mirror only lets the UI grey out
+-// and skip what the server would refuse.
+-
+-export const BOT_SELF_COMMANDS: ReadonlyArray<readonly [string, string]> = [
+-  ['stay', 'stay'],
+-  ['grind', 'grind'],
+-  ['flee', 'flee'],
+-  ['reset botai', 'reset botAI'],
+-  ['release', 'release'],
+-];
+-// Master commands act for the bot's master, who must be on the owner's account.
+-export const BOT_MASTER_COMMANDS: ReadonlyArray<string> = ['follow', 'summon', 'attack', 'tank attack'];
+-export const BOT_COMMAND_SOURCES: ReadonlyArray<BotCommandSource> = ['button', 'text', 'suggestion'];
+-
+-export interface NormalizedBotCommand {
+-  kind: BotCommandKind;
+-  command: string;
+-}
+-
+-// A bot's name from untrusted input (it goes into a console command): letters
+-// only, 2-12, as parseStreamFollow.
+-export function parseBotName(name: unknown): string | null {
+-  return typeof name === 'string' && /^\p{L}{2,12}$/u.test(name) ? name : null;
+-}
+-
+-// The command as the module sends it to playerbots, or null when the module
+-// would answer "not allowed". Words are rejoined with single spaces, as the
+-// module reads them.
+-export function normalizeBotCommand(text: unknown): NormalizedBotCommand | null {
+-  if (typeof text !== 'string') return null;
+-  const joined = text.split(/\s+/).filter(Boolean).join(' ');
+-  // Letters, digits, spaces, + and - only: no command separators.
+-  if (!/^[A-Za-z0-9 +-]+$/.test(joined)) return null;
+-  const lower = joined.toLowerCase();
+-
+-  for (const [name, sent] of BOT_SELF_COMMANDS) {
+-    if (lower === name) return { kind: 'self', command: sent };
+-  }
+-  if (BOT_MASTER_COMMANDS.includes(lower)) return { kind: 'master', command: lower };
+-
+-  // "co +<s>", "co -<s>", "nc +<s>", "nc -<s>": one strategy at a time. The
+-  // module also checks the name against the bot's supported strategies.
+-  if (lower.length > 4 && /^(co|nc) [+-]/.test(lower)) {
+-    const name = lower.slice(4);
+-    if (name.startsWith(' ') || /[+-]/.test(name)) return null;
+-    return { kind: 'strategy', command: lower };
+-  }
+-  return null;
+-}
+-
+-export function buildBotCommandLine(bot: string, command: string): string {
+-  return `wowmin botcmd ${bot} ${command}`;
+-}
+-
+-// The module's reply: "WBOTCMD|ok|<bot>|<command>", "WBOTCMD|refused|<reason>"
+-// or "WBOTCMD|disabled". Anything else is an error.
+-export function parseBotCommandReply(message: string): BotCommandResult {
+-  const reply = message.split(/[\r\n]+/).map((line) => line.trim()).find((line) => line.startsWith('WBOTCMD|'));
+-  if (!reply) return { success: false, status: 'error', reply: message.trim() };
+-  const [, status, ...rest] = reply.split('|');
+-  if (status === 'ok' && rest.length >= 2) {
+-    return { success: true, status: 'ok', reply, bot: rest[0], command: rest.slice(1).join('|') };
+-  }
+-  if (status === 'refused') return { success: false, status: 'refused', reply, reason: rest.join('|') };
+-  if (status === 'disabled') return { success: false, status: 'disabled', reply };
+-  return { success: false, status: 'error', reply };
+-}
++export * from './bot-command-rules';
+ 
+ export interface BotCommandRequest {
+   bot: string;
+@@ -100,20 +33,63 @@ export function checkBotCommandRequest(
+   return { request: { bot: name, command: normalized.command, source: knownSource } };
+ }
+ 
++export interface BotCommandSenderOptions {
++  dataDir: string;
++  execute: (command: string) => Promise<{ success: boolean; message: string }>;
++  // The owner's account (WOWMIN_BOT_OWNER_ACCOUNT), for the panel's master
++  // buttons; 0 when not set.
++  ownerAccountId?: number;
++  now?: () => number;
++}
++
+ // Sends one command over SOAP and logs it to bot-commands.jsonl in the data dir.
++// WoWMin's own off switch (bot-commands.json, off until the owner turns it on)
++// refuses sends without a worldserver restart.
+ export class BotCommandSender {
+   private readonly logPath: string;
++  private readonly settingsPath: string;
++  private readonly execute: BotCommandSenderOptions['execute'];
++  private readonly ownerAccountId: number;
++  private readonly now: () => number;
+   private logChain: Promise<void> = Promise.resolve();
++  private enabled: boolean | null = null;
++
++  constructor(options: BotCommandSenderOptions) {
++    this.logPath = path.join(options.dataDir, 'bot-commands.jsonl');
++    this.settingsPath = path.join(options.dataDir, 'bot-commands.json');
++    this.execute = options.execute;
++    const owner = Number(options.ownerAccountId);
++    this.ownerAccountId = Number.isInteger(owner) && owner > 0 ? owner : 0;
++    this.now = options.now ?? Date.now;
++  }
+ 
+-  constructor(
+-    dataDir: string,
+-    private readonly execute: (command: string) => Promise<{ success: boolean; message: string }>,
+-    private readonly now: () => number = Date.now,
+-  ) {
+-    this.logPath = path.join(dataDir, 'bot-commands.jsonl');
++  async getSettings(): Promise<BotCommandSettings> {
++    return { enabled: await this.isEnabled(), ownerAccountId: this.ownerAccountId };
++  }
++
++  async setEnabled(enabled: boolean): Promise<BotCommandSettings> {
++    await fs.mkdir(path.dirname(this.settingsPath), { recursive: true });
++    await fs.writeFile(this.settingsPath, `${JSON.stringify({ enabled }, null, 2)}
++`, 'utf8');
++    this.enabled = enabled;
++    return this.getSettings();
++  }
++
++  private async isEnabled(): Promise<boolean> {
++    if (this.enabled === null) {
++      try {
++        this.enabled = (JSON.parse(await fs.readFile(this.settingsPath, 'utf8')) as { enabled?: unknown }).enabled === true;
++      } catch {
++        this.enabled = false;
++      }
++    }
++    return this.enabled;
+   }
+ 
+   async send(bot: unknown, command: unknown, source: unknown): Promise<BotCommandResult> {
++    if (!(await this.isEnabled())) {
++      return { success: false, status: 'disabled', reply: '', reason: 'turned off in WoWMin' };
++    }
+     const checked = checkBotCommandRequest(bot, command, source);
+     if ('refused' in checked) return checked.refused;
+     const { request } = checked;
+diff --git a/src/types/api.ts b/src/types/api.ts
+index a8e6c9a..844a1c7 100644
+--- a/src/types/api.ts
++++ b/src/types/api.ts
+@@ -807,6 +807,13 @@ export interface BotCommandResult {
+   reason?: string;
+ }
+ 
++export interface BotCommandSettings {
++  // WoWMin's off switch; the module has its own (BotCommand.Enable).
++  enabled: boolean;
++  // WOWMIN_BOT_OWNER_ACCOUNT, or 0.
++  ownerAccountId: number;
++}
++
+ export interface LogMonitorConfig {
+   host: string;
+   port: number;
+@@ -948,6 +955,8 @@ export type ApiChannels = {
+   'sessions:setRecordingEnabled': (enabled: boolean) => boolean;
+   'sessions:purgeCompleted': () => number;
+   'bots:command': (bot: string, command: string, source?: BotCommandSource) => BotCommandResult;
++  'bots:getCommandSettings': () => BotCommandSettings;
++  'bots:setCommandEnabled': (enabled: boolean) => BotCommandSettings;
+ 
+   'economy:connect': (config: DbConfig) => DbConnectionState;
+   'economy:disconnect': () => void;
+-- 
+2.56.0.windows.2
+

@@ -1,0 +1,1085 @@
+From 1522a6043ff7ea0d082f97f7e7e1b8c621187b66 Mon Sep 17 00:00:00 2001
+From: astrangedaytoday15-dev <342675337+astrangedaytoday15-dev@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 07:04:37 -0400
+Subject: [PATCH 3/3] Bot Control B8: group steering bar
+
+A Group bar in World 3D (followed unit = the owner's character or one of
+its group's bots) and Instance Watch (owner's character in the
+instance). Leader mode moves the owner's character, a self-bot, and the
+group follows; Squad mode sends "stay" to the group bots and moves them
+(the selected bot, or all on a small ring). Tools: Move (click the 3D
+floor, or the flat map at the leader's height), Mark (click a mob: skull),
+Mark nearest (like Tab: nearest live hostile mob to the leader from the
+stream), Clear mark, Hold, Regroup. Commands to one bot are spaced a
+second apart for the module's rate limit.
+
+Backend: "bots:mark" -> "wowmin botmark <player> <icon> <entry>
+<unitId>|clear", parsed WBOTMARK reply, logged with source "group"; the
+allowlist mirror takes "moveto <x> <y> <z>".
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ renderer/scripts/app.ts                 | 140 ++++++++++-
+ renderer/scripts/types/wowmin-api.ts    |   2 +
+ renderer/scripts/utils/bot-group-bar.ts | 316 ++++++++++++++++++++++++
+ renderer/scripts/web-api.ts             |   1 +
+ renderer/styles.css                     |  23 ++
+ scripts/test-bot-command.cjs            |  88 +++++++
+ src/api-backend.ts                      |   5 +-
+ src/bot-command-rules.ts                | 140 ++++++++++-
+ src/bot-command.ts                      |  41 ++-
+ src/types/api.ts                        |  12 +-
+ 10 files changed, 749 insertions(+), 19 deletions(-)
+ create mode 100644 renderer/scripts/utils/bot-group-bar.ts
+
+diff --git a/renderer/scripts/app.ts b/renderer/scripts/app.ts
+index 7d9161f..f8e372c 100644
+--- a/renderer/scripts/app.ts
++++ b/renderer/scripts/app.ts
+@@ -21,8 +21,9 @@ import { getEnglishMotd, getServerUptime } from './utils/dashboard-data';
+ import { calculateSessionTotalsAt, formatSessionReplayTime, isSessionRouteDiscontinuity } from './utils/session-replay';
+ import { getClassIconHtml, getClassIconImage, getPlayerStateIconsHtml, getPlayerStateIndicators, getRacePortraitHtml, getResponsivePlayerIconScale, getStateIconImage, loadPlayerIconManifest } from './utils/player-icons';
+ import { formatBattlegroundOutcome } from '../../src/session-outcome';
+-import { canUseMasterCommands } from '../../src/bot-command-rules';
++import { canUseMasterCommands, findGroupBots, findGroupLeader, invertFlatProjection } from '../../src/bot-command-rules';
+ import { BotCommandPanel, type BotCommandTarget, describeBotCommandResult } from './utils/bot-command-panel';
++import { BotGroupBar } from './utils/bot-group-bar';
+ import { AppState, createInitialState, PlayerInfo } from './types/state';
+ import type { BotCommandResult, BotCommandSettings, CreatureInfo, StreamBotDecision, StreamCreatureSample, StreamStatus } from '../../src/types/api';
+ import type { ConnectionProfile, DbConfig, SoapConfig, EntityMediaPreviewResult, LogMonitorConfig, LogMonitorInspectionResult, MapBattlegroundState, MapInstanceDeath, MapInstanceState, MapPlayerPosition, MapBotWaypoint, CharacterInventoryResult, EconomyOverview, EconomyCharacterGoldResult, EconomyAuctionRow, EconomyMarketSummaryRow, SessionIndexEntry, SessionRecord, SessionRoutePoint } from '../../src/types/api';
+@@ -6154,6 +6155,39 @@ function createBotCommandPanel(parent: HTMLElement | null, className: string, st
+   return panel;
+ }
+ 
++// Group steering: one bar in World 3D and one in Instance Watch.
++function createGroupBar(parent: HTMLElement | null, className: string): BotGroupBar {
++  const bar = new BotGroupBar({
++    command: (bot, command, source) => window.wowminAPI.bots.command(bot, command, source),
++    mark: (player, icon, target, source) => window.wowminAPI.bots.mark(player, icon, target, source),
++  }, onBotCommandResult);
++  bar.root.classList.add(className);
++  parent?.append(bar.root);
++  return bar;
++}
++
++// Screen points of the live mobs drawn last, for the Mark tool.
++interface CreatureHitArea {
++  guid: number;
++  entry: number;
++  x: number;
++  y: number;
++}
++const CREATURE_HIT_RADIUS = 16;
++
++function findCreatureHit(areas: CreatureHitArea[], x: number, y: number): CreatureHitArea | null {
++  let best: CreatureHitArea | null = null;
++  let bestDistance = CREATURE_HIT_RADIUS;
++  for (const area of areas) {
++    const distance = Math.hypot(area.x - x, area.y - y);
++    if (distance <= bestDistance) {
++      best = area;
++      bestDistance = distance;
++    }
++  }
++  return best;
++}
++
+ const mapBotPanel = createBotCommandPanel(
+   $<HTMLElement>('map-selected-panel')?.parentElement ?? null, 'bot-cmd-map', 'wowmin.botCommands.map.collapsed');
+ 
+@@ -6187,6 +6221,8 @@ function refreshBotCommandPanels(): void {
+   if (!botCommandSettings.enabled) {
+     world3dBotPanel.update(null);
+     instanceBotPanel.update(null);
++    world3dGroupBar.update(null);
++    instanceGroupBar.update(null);
+   }
+ }
+ 
+@@ -6646,6 +6682,10 @@ const instanceViewTransforms = new Map<string, InstanceViewTransform>();
+ const instanceSelectedFloorIds = new Map<string, number>();
+ let instanceBaseViewport: InstanceProjectionViewport | null = null;
+ let instanceMarkerHitAreas: Array<{ name: string; x: number; y: number; radius: number }> = [];
++let instanceCreatureHitAreas: CreatureHitArea[] = [];
++// How the last frame projected, for the group bar's Move tool.
++let instanceGroundContext: { iso: boolean; projection: MapProjection } | null = null;
++let instanceGroupLeaderZ: number | null = null;
+ let instancePanStart: { x: number; y: number; panX: number; panY: number; moved: boolean } | null = null;
+ const instanceMapAssets = new Map<number, LoadedInstanceMapAsset | null>();
+ // Live position stream for the selected session.
+@@ -8351,6 +8391,8 @@ function drawInstanceCanvas(followPass: boolean): void {
+   const ctx = $instanceWatchCanvas.getContext('2d');
+   if (!ctx) return;
+   instanceMarkerHitAreas = [];
++  instanceCreatureHitAreas = [];
++  instanceGroundContext = null;
+   instanceBaseViewport = null;
+   instanceIsoContext = null;
+ 
+@@ -8486,6 +8528,7 @@ function drawInstanceCanvas(followPass: boolean): void {
+       : { type: 'bounds', bounds }, viewport);
+     drawInstanceFlatBackground(ctx, viewport, assetImage, Boolean(profile));
+   }
++  instanceGroundContext = { iso: Boolean(isoView), projection };
+   const project = (position: Pick<MapPlayerPosition, 'position_x' | 'position_y' | 'position_z'>) =>
+     projection.worldToScreen(position.position_x, position.position_y, position.position_z);
+ 
+@@ -8593,6 +8636,7 @@ function drawInstanceCanvas(followPass: boolean): void {
+       const model = modelShown(key);
+       const boss = isBossCreature(creature, info);
+       const scenery = sceneryGuids.has(creature.guid);
++      if (creature.alive && !scenery) instanceCreatureHitAreas.push({ guid: creature.guid, entry: creature.entry, x: point.x, y: point.y });
+       // A model has its own ring on the floor, with health and combat.
+       if (!model) {
+         if (!scenery) {
+@@ -8887,6 +8931,7 @@ function renderInstanceBotCard(session: ActiveInstanceSession | null, now: numbe
+   if (!$instanceBotCard || !$instanceBotDecisions) return;
+   instanceBotCardRenderedAt = now;
+   const live = Boolean(session && instanceLiveStream?.key === session.key);
++  updateInstanceGroupBar(session, live, now);
+   const selected = session?.players.find((player) => player.name === selectedInstancePlayerName);
+   instanceBotPanel.update(botCommandTarget(
+     selected,
+@@ -9280,9 +9325,39 @@ $instanceWatchCanvas?.addEventListener('pointerup', (event) => {
+   const rect = $instanceWatchCanvas.getBoundingClientRect();
+   const x = (event.clientX - rect.left) * $instanceWatchCanvas.width / rect.width;
+   const y = (event.clientY - rect.top) * $instanceWatchCanvas.height / rect.height;
++  if (instanceGroupBar.tool) {
++    handleInstanceGroupClick(x, y);
++    return;
++  }
+   const marker = instanceMarkerHitAreas.find((area) => Math.hypot(area.x - x, area.y - y) <= area.radius);
+   if (marker) focusInstancePlayer(marker.name);
+ });
++
++// A click with the group bar's Move or Mark tool armed.
++function handleInstanceGroupClick(x: number, y: number): void {
++  if (instanceGroupBar.tool === 'mark') {
++    const hit = findCreatureHit(instanceCreatureHitAreas, x, y);
++    void instanceGroupBar.onCreatureClick(hit ? { entry: hit.entry, unitId: hit.guid } : null);
++    return;
++  }
++  void instanceGroupBar.onGroundClick(getInstanceGroundPoint(x, y));
++}
++
++// The floor under a canvas point: the 3D scene's surface, or on the flat map
++// the point at the leader's height (the module finds the ground near it).
++function getInstanceGroundPoint(x: number, y: number): [number, number, number] | null {
++  const ground = instanceGroundContext;
++  if (!ground) return null;
++  if (ground.iso) {
++    if (!instanceIsoContext) return null;
++    const { view, width, height } = instanceIsoContext;
++    const picked = getInstanceSceneView()?.pick(view, width, height, x, y) ?? null;
++    return picked ? [picked[0], picked[1], picked[2]] : null;
++  }
++  if (instanceGroupLeaderZ === null) return null;
++  const flat = invertFlatProjection(ground.projection.worldToScreen, x, y, instanceGroupLeaderZ);
++  return flat ? [flat.x, flat.y, instanceGroupLeaderZ] : null;
++}
+ $instanceWatchCanvas?.addEventListener('pointercancel', () => {
+   instancePanStart = null;
+   instanceOrbitStart = null;
+@@ -9302,6 +9377,26 @@ for (const control of document.querySelectorAll<HTMLElement>('.instance-3d-contr
+   control.classList.toggle('hidden', !instanceView3d);
+ }
+ 
++const instanceGroupBar = createGroupBar($<HTMLElement>('instance-bot-commands'), 'bot-group-card');
++
++// Shown when the owner's character is in the watched instance.
++function updateInstanceGroupBar(session: ActiveInstanceSession | null, live: boolean, now: number): void {
++  const leader = botCommandSettings.enabled && session
++    ? findGroupLeader(session.players, botCommandSettings.ownerAccountId) : null;
++  instanceGroupLeaderZ = leader?.position_z ?? null;
++  $instanceWatchCanvas?.classList.toggle('group-armed', Boolean(instanceGroupBar.tool));
++  if (!session || !leader) {
++    instanceGroupBar.update(null);
++    return;
++  }
++  instanceGroupBar.update({
++    leader: { name: leader.name, x: leader.position_x, y: leader.position_y, z: leader.position_z },
++    bots: findGroupBots(session.players, leader).map((player) => player.name),
++    selectedBot: selectedInstancePlayerName,
++    creatures: live ? instanceLiveCreatures.samples(now) : [],
++  });
++}
++
+ const instanceBotPanel = createBotCommandPanel(
+   $<HTMLElement>('instance-bot-commands'), 'bot-cmd-card', 'wowmin.botCommands.instance.collapsed');
+ 
+@@ -9973,7 +10068,10 @@ let world3dStream: { key: string; stop: () => void; status: StreamStatus } | nul
+ // The followed bot's command panel, updated a few times a second.
+ const WORLD3D_BOT_PANEL_MS = 250;
+ const world3dBotPanel = createBotCommandPanel($world3dPanel, 'bot-cmd-world3d', 'wowmin.botCommands.world3d.collapsed');
++const world3dGroupBar = createGroupBar($world3dPanel, 'bot-group-world3d');
+ let world3dBotPanelAt = 0;
++let world3dCreatureHits: CreatureHitArea[] = [];
++let world3dGroundView: { isoView: IsoView; width: number; height: number } | null = null;
+ 
+ function updateWorld3dBotCommands(player: MapPlayerPosition | null, now: number): void {
+   if (now - world3dBotPanelAt < WORLD3D_BOT_PANEL_MS) return;
+@@ -9981,8 +10079,44 @@ function updateWorld3dBotCommands(player: MapPlayerPosition | null, now: number)
+   const decision = player ? world3dLive.bots.get(player.name, now) : null;
+   const noLiveData = world3dStream?.status === 'streaming' ? 'No live data for this bot yet.' : 'Waiting for the live stream.';
+   world3dBotPanel.update(botCommandTarget(player, mapAllPlayers, decision, noLiveData), now);
++  updateWorld3dGroupBar(player, now);
++}
++
++// Shown when the followed unit is the owner's character or one of its
++// group's bots.
++function updateWorld3dGroupBar(player: MapPlayerPosition | null, now: number): void {
++  $world3dOverlay?.classList.toggle('group-armed', Boolean(world3dGroupBar.tool));
++  const leader = botCommandSettings.enabled && player
++    ? findGroupLeader(mapAllPlayers.filter((unit) => unit.map === player.map), botCommandSettings.ownerAccountId) : null;
++  const bots = findGroupBots(mapAllPlayers, leader).map((unit) => unit.name);
++  if (!player || !leader || (player.name !== leader.name && !bots.includes(player.name))) {
++    world3dGroupBar.update(null);
++    return;
++  }
++  world3dGroupBar.update({
++    leader: { name: leader.name, x: leader.position_x, y: leader.position_y, z: leader.position_z },
++    bots,
++    selectedBot: bots.includes(player.name) ? player.name : null,
++    creatures: world3dLive.creatures.samples(now),
++  });
+ }
+ 
++$world3dOverlay?.addEventListener('click', (event) => {
++  const tool = world3dGroupBar.tool;
++  if (!tool || !$world3dOverlay) return;
++  const rect = $world3dOverlay.getBoundingClientRect();
++  const x = (event.clientX - rect.left) * ($world3dOverlay.width / rect.width);
++  const y = (event.clientY - rect.top) * ($world3dOverlay.height / rect.height);
++  if (tool === 'mark') {
++    const hit = findCreatureHit(world3dCreatureHits, x, y);
++    void world3dGroupBar.onCreatureClick(hit ? { entry: hit.entry, unitId: hit.guid } : null);
++    return;
++  }
++  const ground = world3dGroundView;
++  const picked = ground ? getWorld3dSceneView()?.pick(ground.isoView, ground.width, ground.height, x, y) ?? null : null;
++  void world3dGroupBar.onGroundClick(picked ? [picked[0], picked[1], picked[2]] : null);
++});
++
+ function getWorld3dSceneView(): InstanceSceneView | null {
+   if (world3dSceneView === undefined) {
+     world3dSceneView = $world3dScene && InstanceSceneView.isSupported()
+@@ -10039,6 +10173,7 @@ function closeWorld3d(): void {
+   world3dName = null;
+   syncWorld3dStream(null);
+   world3dBotPanel.update(null);
++  world3dGroupBar.update(null);
+   if (world3dPoll) { clearInterval(world3dPoll); world3dPoll = null; }
+   if (world3dFrame !== null) { cancelAnimationFrame(world3dFrame); world3dFrame = null; }
+   if ($world3dPanel) $world3dPanel.hidden = true;
+@@ -10223,6 +10358,7 @@ function renderWorld3d(): void {
+   };
+   const isoView = createIsoView(box, width, height, world3dYaw, ISO_PITCH, { zoom: 1, panX: 0, panY: 0 });
+   const drawn = view.render(urls, isoView, width, height, [], { height: WORLD3D_HEIGHT, horizontal: null, reach: null });
++  world3dGroundView = { isoView, width, height };
+   $world3dScene.hidden = !drawn;
+ 
+   const project = (point: WorldPoint) => isoView.projection.worldToScreen(point[0], point[1], point[2]);
+@@ -10278,6 +10414,7 @@ function renderWorld3d(): void {
+   const onCanvas = (point: { x: number; y: number }) => point.x >= -50 && point.y >= -50 && point.x <= width + 50 && point.y <= height + 50;
+   // NPCs and mobs: a marker until their model is in; plates for the living
+   // that are not scenery (in combat ones kept over the rest).
++  world3dCreatureHits = [];
+   for (const creature of [...creatures].sort((left, right) => Number(left.alive) - Number(right.alive))) {
+     const info = instanceCreatureInfo.get(creature.entry);
+     const key = unitKey(creature.guid, true);
+@@ -10286,6 +10423,7 @@ function renderWorld3d(): void {
+     if (!onCanvas(point)) continue;
+     const isScenery = scenery.has(creature.guid);
+     if (!model) drawInstanceCreature(ctx, creature, info, point, 1, isScenery);
++    if (creature.alive && !isScenery) world3dCreatureHits.push({ guid: creature.guid, entry: creature.entry, x: point.x, y: point.y });
+     if (!info || !creature.alive || isScenery) continue;
+     const boss = isBossCreature(creature, info);
+     const top = model ? project([creature.x, creature.y, creature.z + INSTANCE_CREATURE_MODEL_HEIGHT]).y - 2 : point.y - 10;
+diff --git a/renderer/scripts/types/wowmin-api.ts b/renderer/scripts/types/wowmin-api.ts
+index 864ea85..bec75e4 100644
+--- a/renderer/scripts/types/wowmin-api.ts
++++ b/renderer/scripts/types/wowmin-api.ts
+@@ -3,6 +3,7 @@ import type {
+   BotCommandResult,
+   BotCommandSettings,
+   BotCommandSource,
++  BotMarkTarget,
+   CharacterInventoryResult,
+   ConnectionProfile,
+   DbConfig,
+@@ -91,6 +92,7 @@ export interface WowminAPI {
+   };
+   bots: {
+     command(bot: string, command: string, source: BotCommandSource): Promise<BotCommandResult>;
++    mark(player: string, icon: string, target: BotMarkTarget | null, source: BotCommandSource): Promise<BotCommandResult>;
+     getCommandSettings(): Promise<BotCommandSettings>;
+     setCommandEnabled(enabled: boolean): Promise<BotCommandSettings>;
+   };
+diff --git a/renderer/scripts/utils/bot-group-bar.ts b/renderer/scripts/utils/bot-group-bar.ts
+new file mode 100644
+index 0000000..7a37d74
+--- /dev/null
++++ b/renderer/scripts/utils/bot-group-bar.ts
+@@ -0,0 +1,316 @@
++import type { BotCommandResult, BotCommandSource, BotMarkTarget } from '../../../src/types/api';
++import {
++  buildMoveCommand, findNearestMarkable, type MarkableCreature, squadMovePoints,
++} from '../../../src/bot-command-rules';
++import { describeBotCommandResult } from './bot-command-panel';
++
++// Group steering: steering the owner's group. LEADER mode moves
++// the owner's character as a self-bot and the group follows it; SQUAD mode
++// parks the bots ("stay") and moves them to points. Marks put a raid icon on
++// a mob for the group; bots attack the skull by default. The module checks
++// every command again.
++
++export type GroupMode = 'leader' | 'squad';
++export type GroupTool = 'move' | 'mark' | null;
++
++export interface GroupBarContext {
++  // The owner's character, or null when it is not in view.
++  leader: { name: string; x: number; y: number; z: number } | null;
++  // The bots in the leader's group, in view.
++  bots: string[];
++  // A selected group bot: Squad moves only it.
++  selectedBot: string | null;
++  // Live creatures for "Mark nearest"; empty without the stream.
++  creatures: MarkableCreature[];
++}
++
++export interface GroupBarApi {
++  command: (bot: string, command: string, source: BotCommandSource) => Promise<BotCommandResult>;
++  mark: (player: string, icon: string, target: BotMarkTarget | null, source: BotCommandSource) => Promise<BotCommandResult>;
++}
++
++// Playerbots' default rti target, which the bots attack.
++const MARK_ICON = 'skull';
++// "Mark nearest" looks this far round the leader (the module allows up to
++// playerbots' sightDistance).
++const MARK_NEAREST_YARDS = 60;
++// The module takes one command per bot per second.
++const PER_BOT_MS = 1050;
++const MODE_STORAGE_KEY = 'wowmin.botGroup.mode';
++
++function element<K extends keyof HTMLElementTagNameMap>(tag: K, className: string, text = ''): HTMLElementTagNameMap[K] {
++  const node = document.createElement(tag);
++  node.className = className;
++  if (text) node.textContent = text;
++  return node;
++}
++
++function delay(ms: number): Promise<void> {
++  return new Promise((resolve) => setTimeout(resolve, ms));
++}
++
++export class BotGroupBar {
++  readonly root: HTMLElement;
++  private readonly modeButtons: Record<GroupMode, HTMLButtonElement>;
++  private readonly toolButtons: Record<'move' | 'mark', HTMLButtonElement>;
++  private readonly actionButtons: HTMLButtonElement[] = [];
++  private readonly reply: HTMLElement;
++  private readonly hint: HTMLElement;
++  private context: GroupBarContext | null = null;
++  private mode: GroupMode = 'leader';
++  private armed: GroupTool = null;
++  private busy = false;
++  private readonly lastSent = new Map<string, number>();
++
++  constructor(
++    private readonly api: GroupBarApi,
++    private readonly onResult: (bot: string, command: string, result: BotCommandResult) => void = () => {},
++  ) {
++    this.root = element('div', 'bot-group hidden');
++    const head = element('div', 'bot-group-head');
++    head.append(element('span', 'bot-cmd-title', 'Group'));
++    const modes = element('div', 'bot-group-modes');
++    this.modeButtons = {
++      leader: this.button('Leader', 'Move your character (a self-bot); the group follows. Switching sends "follow" to the group bots.'),
++      squad: this.button('Squad', 'Your character stays put; the bots hold and move to points. Switching sends "stay" to the group bots.'),
++    };
++    modes.append(this.modeButtons.leader, this.modeButtons.squad);
++    head.append(modes);
++
++    const tools = element('div', 'bot-cmd-row');
++    this.toolButtons = {
++      move: this.button('Move', 'Then click the ground (Esc cancels)'),
++      mark: this.button('Mark', 'Then click a mob: skull (Esc cancels)'),
++    };
++    const nearest = this.button('Mark nearest', 'Skull on the nearest live hostile mob to your character, like Tab');
++    const clear = this.button('Clear mark', 'Remove the skull');
++    const hold = this.button('Hold', 'Leader: your character stays. Squad: every bot stays.');
++    const regroup = this.button('Regroup', 'Every group bot follows your character again (Leader mode)');
++    tools.append(this.toolButtons.move, this.toolButtons.mark, nearest, clear, hold, regroup);
++    this.actionButtons.push(this.toolButtons.move, this.toolButtons.mark, nearest, clear, hold, regroup,
++      this.modeButtons.leader, this.modeButtons.squad);
++
++    this.hint = element('div', 'bot-cmd-hint');
++    this.reply = element('div', 'action-result bot-cmd-reply');
++    this.root.append(head, tools, this.hint, this.reply);
++
++    try {
++      if (localStorage.getItem(MODE_STORAGE_KEY) === 'squad') this.mode = 'squad';
++    } catch {
++      // Remembering the mode is a convenience only.
++    }
++    this.modeButtons.leader.addEventListener('click', () => void this.setMode('leader'));
++    this.modeButtons.squad.addEventListener('click', () => void this.setMode('squad'));
++    this.toolButtons.move.addEventListener('click', () => this.arm(this.armed === 'move' ? null : 'move'));
++    this.toolButtons.mark.addEventListener('click', () => this.arm(this.armed === 'mark' ? null : 'mark'));
++    nearest.addEventListener('click', () => void this.markNearest());
++    clear.addEventListener('click', () => void this.clearMark());
++    hold.addEventListener('click', () => void this.hold());
++    regroup.addEventListener('click', () => void this.regroup());
++    document.addEventListener('keydown', (event) => {
++      if (event.key === 'Escape' && this.armed) this.arm(null);
++    });
++    this.sync();
++  }
++
++  // The armed tool: the view sends its next click here.
++  get tool(): GroupTool {
++    return this.context ? this.armed : null;
++  }
++
++  update(context: GroupBarContext | null): void {
++    this.context = context;
++    this.root.classList.toggle('hidden', !context);
++    if (!context) this.armed = null;
++    this.sync();
++  }
++
++  // A click on the ground with the Move tool armed; null = nothing there.
++  async onGroundClick(point: [number, number, number] | null): Promise<void> {
++    if (this.armed !== 'move') return;
++    this.arm(null);
++    const context = this.context;
++    if (!context) return;
++    if (!point) {
++      this.showReply(false, 'No ground there: click on the floor.');
++      return;
++    }
++    const [x, y, z] = point;
++    if (this.mode === 'leader') {
++      if (!context.leader) return;
++      await this.send([[context.leader.name, buildMoveCommand(x, y, z)]], 'Move');
++      return;
++    }
++    const bots = context.selectedBot && context.bots.includes(context.selectedBot) ? [context.selectedBot] : context.bots;
++    const points = squadMovePoints(x, y, z, bots.length);
++    await this.send(bots.map((bot, index) => [bot, buildMoveCommand(...points[index])]), 'Move');
++  }
++
++  // A click on a mob with the Mark tool armed; null = no mob there.
++  async onCreatureClick(creature: BotMarkTarget | null): Promise<void> {
++    if (this.armed !== 'mark') return;
++    this.arm(null);
++    if (!creature) {
++      this.showReply(false, 'No mob there: click on one.');
++      return;
++    }
++    await this.markTarget(creature, 'Mark');
++  }
++
++  private button(label: string, title: string): HTMLButtonElement {
++    const button = element('button', 'btn btn-tiny', label);
++    button.type = 'button';
++    button.title = title;
++    return button;
++  }
++
++  private arm(tool: GroupTool): void {
++    this.armed = tool;
++    this.sync();
++  }
++
++  private sync(): void {
++    const context = this.context;
++    const disabled = this.busy || !context?.leader;
++    for (const button of this.actionButtons) button.disabled = disabled;
++    if (context?.leader && !context.bots.length) {
++      this.modeButtons.squad.disabled = true;
++      if (this.mode === 'squad') this.mode = 'leader';
++    }
++    for (const mode of ['leader', 'squad'] as const) {
++      this.modeButtons[mode].setAttribute('aria-pressed', String(this.mode === mode));
++    }
++    for (const tool of ['move', 'mark'] as const) {
++      this.toolButtons[tool].setAttribute('aria-pressed', String(this.armed === tool));
++    }
++    this.root.classList.toggle('armed', Boolean(this.armed));
++    this.hint.textContent = !context
++      ? ''
++      : !context.leader
++        ? 'Your character is not in view (WOWMIN_BOT_OWNER_ACCOUNT).'
++        : this.armed === 'move'
++          ? `Click the ground: ${this.mode === 'leader' ? context.leader.name : this.squadLabel(context)} moves there.`
++          : this.armed === 'mark'
++            ? 'Click a mob to put the skull on it.'
++            : this.mode === 'leader'
++              ? `Leader: ${context.leader.name} (self-bot), ${context.bots.length} bot${context.bots.length === 1 ? '' : 's'} following.`
++              : `Squad: ${this.squadLabel(context)} hold and move to points.`;
++  }
++
++  private squadLabel(context: GroupBarContext): string {
++    return context.selectedBot && context.bots.includes(context.selectedBot)
++      ? context.selectedBot
++      : `${context.bots.length} bot${context.bots.length === 1 ? '' : 's'}`;
++  }
++
++  private async setMode(mode: GroupMode): Promise<void> {
++    const context = this.context;
++    if (!context || mode === this.mode) return;
++    this.mode = mode;
++    try {
++      localStorage.setItem(MODE_STORAGE_KEY, mode);
++    } catch {
++      // Remembering the mode is a convenience only.
++    }
++    this.sync();
++    await this.send(context.bots.map((bot) => [bot, mode === 'squad' ? 'stay' : 'follow']), mode === 'squad' ? 'Squad' : 'Leader');
++  }
++
++  private async hold(): Promise<void> {
++    const context = this.context;
++    if (!context?.leader) return;
++    await this.send(this.mode === 'leader' ? [[context.leader.name, 'stay']] : context.bots.map((bot) => [bot, 'stay']), 'Hold');
++  }
++
++  private async regroup(): Promise<void> {
++    const context = this.context;
++    if (!context) return;
++    if (this.mode === 'squad') {
++      this.mode = 'leader';
++      try {
++        localStorage.setItem(MODE_STORAGE_KEY, this.mode);
++      } catch {
++        // Remembering the mode is a convenience only.
++      }
++    }
++    await this.send(context.bots.map((bot) => [bot, 'follow']), 'Regroup');
++  }
++
++  private async markNearest(): Promise<void> {
++    const context = this.context;
++    if (!context?.leader) return;
++    const creature = findNearestMarkable(context.creatures, context.leader, MARK_NEAREST_YARDS);
++    if (!creature) {
++      this.showReply(false, context.creatures.length
++        ? `No live hostile mob within ${MARK_NEAREST_YARDS} yd.`
++        : 'No live mob data: open the stream (World 3D follow or Instance Watch).');
++      return;
++    }
++    await this.markTarget({ entry: creature.entry, unitId: creature.guid }, 'Mark nearest');
++  }
++
++  private async clearMark(): Promise<void> {
++    await this.markTarget(null, 'Clear mark');
++  }
++
++  private async markTarget(target: BotMarkTarget | null, label: string): Promise<void> {
++    const leader = this.context?.leader;
++    if (!leader || this.busy) return;
++    this.busy = true;
++    this.sync();
++    let result: BotCommandResult;
++    try {
++      result = await this.api.mark(leader.name, MARK_ICON, target, 'group');
++    } catch (error) {
++      result = { success: false, status: 'error', reply: error instanceof Error ? error.message : String(error) };
++    }
++    this.busy = false;
++    this.onResult(leader.name, target ? `mark ${MARK_ICON}` : `clear ${MARK_ICON}`, result);
++    this.showReply(result.success, `${label}: ${describeBotCommandResult(result)}`);
++    this.sync();
++  }
++
++  // Sends each [bot, command] in turn, a bot's second command a second after
++  // its first (the module's rate limit), and sums the replies up.
++  private async send(commands: Array<[string, string]>, label: string): Promise<void> {
++    if (this.busy) return;
++    if (!commands.length) {
++      this.showReply(false, `${label}: no group bots in view.`);
++      return;
++    }
++    this.busy = true;
++    this.sync();
++    const failures: string[] = [];
++    let ok = 0;
++    for (const [bot, command] of commands) {
++      const wait = (this.lastSent.get(bot) ?? 0) + PER_BOT_MS - Date.now();
++      if (wait > 0) await delay(wait);
++      let result: BotCommandResult;
++      try {
++        result = await this.api.command(bot, command, 'group');
++      } catch (error) {
++        result = { success: false, status: 'error', reply: error instanceof Error ? error.message : String(error) };
++      }
++      this.lastSent.set(bot, Date.now());
++      this.onResult(bot, command, result);
++      if (result.success) ok += 1;
++      else failures.push(`${bot}: ${describeLeaderHint(result, bot === this.context?.leader?.name)}`);
++    }
++    this.busy = false;
++    this.showReply(!failures.length, `${label}: ${ok}/${commands.length} ok${failures.length ? ` · ${failures.join(' · ')}` : ''}`);
++    this.sync();
++  }
++
++  private showReply(ok: boolean, text: string): void {
++    this.reply.textContent = text;
++    this.reply.className = `action-result bot-cmd-reply visible ${ok ? 'ok' : 'err'}`;
++  }
++}
++
++// The module refuses the owner's character unless it is a self-bot.
++function describeLeaderHint(result: BotCommandResult, isLeader: boolean): string {
++  if (isLeader && result.status === 'refused' && (result.reason === 'no such bot online' || result.reason === 'not a bot')) {
++    return 'not a self-bot: type .playerbots bot self in game';
++  }
++  return describeBotCommandResult(result);
++}
+diff --git a/renderer/scripts/web-api.ts b/renderer/scripts/web-api.ts
+index 842ffd6..8beaa22 100644
+--- a/renderer/scripts/web-api.ts
++++ b/renderer/scripts/web-api.ts
+@@ -103,6 +103,7 @@ const wowminAPI: WowminAPI = {
+   },
+   bots: {
+     command: (bot, command, source) => invoke('bots:command', bot, command, source),
++    mark: (player, icon, target, source) => invoke('bots:mark', player, icon, target, source),
+     getCommandSettings: () => invoke('bots:getCommandSettings'),
+     setCommandEnabled: (enabled) => invoke('bots:setCommandEnabled', enabled),
+   },
+diff --git a/renderer/styles.css b/renderer/styles.css
+index 0ec44f2..b86af90 100644
+--- a/renderer/styles.css
++++ b/renderer/styles.css
+@@ -4256,3 +4256,26 @@ tbody tr:hover { background: var(--tint-accent-05); }
+ .bot-cmd-input { flex: 1; min-width: 0; font-family: var(--font-mono); font-size: 11px; }
+ .bot-cmd-input.refused { border-color: var(--color-danger); }
+ .bot-cmd-reply { margin-top: 0; padding: 4px 8px; font-size: 11px; }
++
++/* Group steering: Leader / Squad bar in World 3D and
++   Instance Watch. */
++.bot-group {
++  display: flex;
++  flex-direction: column;
++  gap: 6px;
++  width: 340px;
++  max-width: calc(100% - 20px);
++  padding: 8px 10px;
++  border: 1px solid var(--border);
++  border-radius: var(--radius);
++  background: var(--bg-card);
++  font-size: 12px;
++}
++.bot-group.hidden { display: none; }
++.bot-group.armed { border-color: var(--yellow); }
++.bot-group-world3d { position: absolute; z-index: 2; right: 10px; bottom: 12px; background: rgba(8, 17, 29, 0.88); }
++.bot-group-card { width: auto; max-width: none; margin-top: 10px; }
++.bot-group-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
++.bot-group-modes { display: flex; gap: 2px; }
++.bot-group .btn[aria-pressed="true"] { border-color: var(--yellow); color: var(--yellow); }
++canvas.group-armed { cursor: crosshair; }
+diff --git a/scripts/test-bot-command.cjs b/scripts/test-bot-command.cjs
+index 4b37d4c..85a776e 100644
+--- a/scripts/test-bot-command.cjs
++++ b/scripts/test-bot-command.cjs
+@@ -23,6 +23,8 @@ new Function('module', 'exports', 'require', '__dirname', '__filename', output)(
+ const {
+   BotCommandSender, botStrategyPrefix, buildBotCommandLine, canUseMasterCommands, diffBotStrategies,
+   expectedStrategyChange, normalizeBotCommand, parseBotCommandReply, parseBotName, BOT_PANEL_STRATEGIES,
++  buildBotMarkLine, findGroupBots, findGroupLeader, findNearestMarkable, invertFlatProjection, parseBotMarkReply,
++  squadMovePoints,
+ } = moduleValue.exports;
+ 
+ const plain = (value) => JSON.parse(JSON.stringify(value));
+@@ -214,3 +216,89 @@ test('panel helpers: strategy prefix, add list, master buttons, changes', () =>
+   assert.deepEqual(plain(expectedStrategyChange('co +avoid aoe')), { prefix: 'co', name: 'avoid aoe', adding: true });
+   assert.equal(expectedStrategyChange('stay'), null);
+ });
++
++test('moveto: three plain numbers, sent with two decimals (B7 module)', () => {
++  assert.deepEqual(plain(normalizeBotCommand('moveto -10238.6 1219.9 42.2')), {
++    kind: 'move', command: 'moveto -10238.60 1219.90 42.20',
++  });
++  assert.deepEqual(plain(normalizeBotCommand('moveto  1 2  3')), { kind: 'move', command: 'moveto 1.00 2.00 3.00' });
++  for (const text of ['moveto -10238.6;1219.9;42.2', 'moveto 1 2', 'moveto 1 2 3 4', 'moveto 1e3 2 3', 'moveto x 2 3',
++    'moveto 1 2 NaN', 'Moveto 1 2 3', 'moveto +1 2 3', 'go 1;2;3']) {
++    assert.equal(normalizeBotCommand(text), null, text);
++  }
++});
++
++test('botmark lines and replies (B7 module)', () => {
++  assert.equal(buildBotMarkLine('Ownerchar', 'skull', { entry: 299, unitId: 805306470 }),
++    'wowmin botmark Ownerchar skull 299 805306470');
++  assert.equal(buildBotMarkLine('Ownerchar', 'cross', null), 'wowmin botmark Ownerchar cross clear');
++  for (const [player, icon, target] of [
++    ['Owner char', 'skull', null], ['Ownerchar', 'bones', null], ['Ownerchar', 'skull', { entry: -1, unitId: 2 }],
++    ['Ownerchar', 'skull', { entry: 1.5, unitId: 2 }], ['Ownerchar', 'skull', { entry: 1, unitId: 2 ** 32 }],
++  ]) {
++    assert.equal(buildBotMarkLine(player, icon, target), null, JSON.stringify([player, icon, target]));
++  }
++  assert.deepEqual(plain(parseBotMarkReply('WBOTMARK|ok|skull|299|805306470')), {
++    success: true, status: 'ok', reply: 'WBOTMARK|ok|skull|299|805306470', command: 'mark skull 299 805306470',
++  });
++  assert.deepEqual(plain(parseBotMarkReply('WBOTMARK|cleared|skull\n')), {
++    success: true, status: 'ok', reply: 'WBOTMARK|cleared|skull', command: 'clear skull',
++  });
++  assert.equal(parseBotMarkReply('WBOTMARK|refused|not the owner').reason, 'not the owner');
++  assert.equal(parseBotMarkReply('WBOTMARK|disabled').status, 'disabled');
++  assert.equal(parseBotMarkReply('WBOTCMD|ok|a|b').status, 'error');
++});
++
++test('the sender marks through "wowmin botmark" and logs it', async () => {
++  const { dataDir, sent, sender, readLog } = await senderFixture([
++    { success: true, message: 'WBOTMARK|ok|skull|299|805306470' },
++    { success: true, message: 'WBOTMARK|cleared|skull' },
++  ]);
++  try {
++    assert.equal((await sender.mark('Ownerchar', 'skull', { entry: 299, unitId: 805306470 }, 'group')).status, 'ok');
++    assert.equal((await sender.mark('Ownerchar', 'skull', null)).command, 'clear skull');
++    assert.equal((await sender.mark('Ownerchar', 'bones', null, 'group')).reason, 'not allowed');
++    assert.deepEqual(sent, ['wowmin botmark Ownerchar skull 299 805306470', 'wowmin botmark Ownerchar skull clear']);
++    assert.deepEqual((await readLog()).map(({ bot, command, source }) => [bot, command, source]), [
++      ['Ownerchar', 'mark skull 299 805306470', 'group'],
++      ['Ownerchar', 'mark skull clear', 'group'],
++    ]);
++  } finally {
++    await fs.rm(dataDir, { recursive: true, force: true });
++  }
++});
++
++test('group steering helpers: leader, group bots, mark nearest, squad points, flat clicks', () => {
++  const unit = (name, isBot, accountId, groupId, x = 0, y = 0, z = 0) =>
++    ({ name, isBot, accountId, groupId, map: 0, position_x: x, position_y: y, position_z: z });
++  const leader = unit('Ownerchar', false, 101, 9);
++  const players = [unit('Tulli', true, 5, 0), unit('Pally', true, 101, 9), leader, unit('Stranger', false, 33, 9),
++    unit('Grouptwo', true, 6, 9), unit('Other', true, 7, 4)];
++  assert.equal(findGroupLeader(players, 101).name, 'Ownerchar');
++  assert.equal(findGroupLeader(players, 0), null);
++  assert.equal(findGroupLeader(players, 555), null);
++  assert.deepEqual(findGroupBots(players, leader).map((player) => player.name), ['Pally', 'Grouptwo']);
++  assert.deepEqual(findGroupBots(players, { ...leader, groupId: 0 }), []);
++  assert.deepEqual(findGroupBots(players, null), []);
++
++  const mob = (guid, x, extra = {}) => ({ guid, entry: 1, x, y: 0, z: 0, alive: true, hostile: true, playerControlled: false, ...extra });
++  const creatures = [mob(1, 30), mob(2, 5, { alive: false }), mob(3, 6, { hostile: false }), mob(4, 7, { scenery: true }),
++    mob(5, 8, { playerControlled: true }), mob(6, 20), mob(7, 70)];
++  assert.equal(findNearestMarkable(creatures, { x: 0, y: 0, z: 0 }, 60).guid, 6);
++  assert.equal(findNearestMarkable([mob(7, 70)], { x: 0, y: 0, z: 0 }, 60), null);
++
++  assert.deepEqual(squadMovePoints(1, 2, 3, 1), [[1, 2, 3]]);
++  assert.deepEqual(squadMovePoints(1, 2, 3, 0), []);
++  const ring = squadMovePoints(0, 0, 5, 4, 2);
++  assert.equal(ring.length, 4);
++  for (const [x, y, z] of ring) {
++    assert.ok(Math.abs(Math.hypot(x, y) - 2) < 1e-9);
++    assert.equal(z, 5);
++  }
++
++  // A flat map: rotated, scaled and shifted, as the minimap projections are.
++  const worldToScreen = (x, y) => ({ x: 400 - y * 0.5, y: 300 - x * 0.5 });
++  const back = invertFlatProjection(worldToScreen, 350, 200, 0);
++  assert.ok(Math.abs(back.x - 200) < 1e-9 && Math.abs(back.y - 100) < 1e-9, JSON.stringify(back));
++  assert.equal(invertFlatProjection(() => ({ x: 1, y: 1 }), 5, 5, 0), null);
++});
+diff --git a/src/api-backend.ts b/src/api-backend.ts
+index c875cb0..3be9442 100644
+--- a/src/api-backend.ts
++++ b/src/api-backend.ts
+@@ -4,7 +4,7 @@ import packageJson from '../package.json';
+ import { SoapClient } from './soap-client';
+ import { ConfigStore } from './config-store';
+ import { getDbService, DatabaseService } from './database/db-service';
+-import { SoapConfig, SoapResult, ConnectionProfile, DbConfig, DbConnectionState, QueryResult, FieldInfo, EntityMediaPreviewRequest, EntityMediaPreviewResult, LogMonitorConfig, LogMonitorInspectionResult, LogMonitorFileTailResult, MapPlayerPosition, MapPlayerSnapshot, MapOnlineCounts, OnlinePlayerRow, MapBotWaypointRequest, MapBotWaypoint, CharacterInventoryResult, CharacterInventoryItemRow, EconomyOverview, EconomyCharacterGoldResult, EconomyAuctionRow, EconomyMarketSummaryRow, SessionIndexEntry, SessionRecord, BotCommandResult, BotCommandSettings, BotCommandSource, BackendConnectionStatus, ManagedServiceName, CreatureInfo } from './types/api';
++import { SoapConfig, SoapResult, ConnectionProfile, DbConfig, DbConnectionState, QueryResult, FieldInfo, EntityMediaPreviewRequest, EntityMediaPreviewResult, LogMonitorConfig, LogMonitorInspectionResult, LogMonitorFileTailResult, MapPlayerPosition, MapPlayerSnapshot, MapOnlineCounts, OnlinePlayerRow, MapBotWaypointRequest, MapBotWaypoint, CharacterInventoryResult, CharacterInventoryItemRow, EconomyOverview, EconomyCharacterGoldResult, EconomyAuctionRow, EconomyMarketSummaryRow, SessionIndexEntry, SessionRecord, BotCommandResult, BotCommandSettings, BotCommandSource, BotMarkTarget, BackendConnectionStatus, ManagedServiceName, CreatureInfo } from './types/api';
+ import { ManagedConnectionLifecycle } from './managed-connection-lifecycle';
+ import { inspectRemoteLogs, readRemoteLogTail } from './log-monitor-service';
+ import { buildLiveMapTelemetryCommand, parseLiveMapTelemetrySnapshot } from './live-map-telemetry';
+@@ -1176,6 +1176,9 @@ apiRouter.handle('sessions:purgeCompleted', async (): Promise<number> => session
+ apiRouter.handle('bots:command', async (_event, bot: string, command: string, source?: BotCommandSource): Promise<BotCommandResult> =>
+   botCommandSender.send(bot, command, source));
+ 
++apiRouter.handle('bots:mark', async (_event, player: string, icon: string, target: BotMarkTarget | null, source?: BotCommandSource): Promise<BotCommandResult> =>
++  botCommandSender.mark(player, icon, target, source));
++
+ apiRouter.handle('bots:getCommandSettings', async (): Promise<BotCommandSettings> => botCommandSender.getSettings());
+ 
+ apiRouter.handle('bots:setCommandEnabled', async (_event, enabled: boolean): Promise<BotCommandSettings> =>
+diff --git a/src/bot-command-rules.ts b/src/bot-command-rules.ts
+index f810f49..7c7fbf7 100644
+--- a/src/bot-command-rules.ts
++++ b/src/bot-command-rules.ts
+@@ -1,4 +1,4 @@
+-import type { BotCommandKind, BotCommandResult, BotCommandSource } from './types/api';
++import type { BotCommandKind, BotCommandResult, BotCommandSource, BotMarkTarget } from './types/api';
+ 
+ // Bot control: one playerbot command sent through mod-wowmin-telemetry's
+ // "wowmin botcmd". The module's allowlist (NormalizeBotCommand in
+@@ -14,7 +14,7 @@ export const BOT_SELF_COMMANDS: ReadonlyArray<readonly [string, string]> = [
+ ];
+ // Master commands act for the bot's master, who must be on the owner's account.
+ export const BOT_MASTER_COMMANDS: ReadonlyArray<string> = ['follow', 'summon', 'attack', 'tank attack'];
+-export const BOT_COMMAND_SOURCES: ReadonlyArray<BotCommandSource> = ['button', 'text', 'suggestion'];
++export const BOT_COMMAND_SOURCES: ReadonlyArray<BotCommandSource> = ['button', 'text', 'suggestion', 'group'];
+ 
+ export interface NormalizedBotCommand {
+   kind: BotCommandKind;
+@@ -33,6 +33,14 @@ export function parseBotName(name: unknown): string | null {
+ export function normalizeBotCommand(text: unknown): NormalizedBotCommand | null {
+   if (typeof text !== 'string') return null;
+   const joined = text.split(/\s+/).filter(Boolean).join(' ');
++  // "moveto <x> <y> <z>": the module builds "go x;y;z" itself.
++  const move = /^moveto (\S+) (\S+) (\S+)$/.exec(joined);
++  if (move) {
++    const point = move.slice(1).map(parseMoveNumber);
++    return point.every((value) => value !== null)
++      ? { kind: 'move', command: buildMoveCommand(point[0] as number, point[1] as number, point[2] as number) }
++      : null;
++  }
+   // Letters, digits, spaces, + and - only: no command separators.
+   if (!/^[A-Za-z0-9 +-]+$/.test(joined)) return null;
+   const lower = joined.toLowerCase();
+@@ -52,6 +60,14 @@ export function normalizeBotCommand(text: unknown): NormalizedBotCommand | null
+   return null;
+ }
+ 
++function parseMoveNumber(text: string): number | null {
++  return /^-?\d+(\.\d+)?$/.test(text) && Number.isFinite(Number(text)) ? Number(text) : null;
++}
++
++export function buildMoveCommand(x: number, y: number, z: number): string {
++  return `moveto ${x.toFixed(2)} ${y.toFixed(2)} ${z.toFixed(2)}`;
++}
++
+ export function buildBotCommandLine(bot: string, command: string): string {
+   return `wowmin botcmd ${bot} ${command}`;
+ }
+@@ -116,3 +132,123 @@ export function expectedStrategyChange(command: string): { prefix: 'co' | 'nc';
+   const match = /^(co|nc) ([+-])(.+)$/.exec(command);
+   return match ? { prefix: match[1] as 'co' | 'nc', name: match[3], adding: match[2] === '+' } : null;
+ }
++
++// ── Group steering ───────────────────────────────────────────
++
++export const BOT_MARK_ICONS: ReadonlyArray<string> = ['star', 'circle', 'diamond', 'triangle', 'moon', 'square', 'cross', 'skull'];
++
++function isUint32(value: unknown): value is number {
++  return typeof value === 'number' && Number.isInteger(value) && value >= 0 && value <= 0xffffffff;
++}
++
++// "wowmin botmark <player> <icon> <entry> <unitId>" or "... <icon> clear";
++// null for anything the module would not take.
++export function buildBotMarkLine(player: unknown, icon: unknown, target: BotMarkTarget | null): string | null {
++  const name = parseBotName(player);
++  if (!name || typeof icon !== 'string' || !BOT_MARK_ICONS.includes(icon)) return null;
++  if (target === null) return `wowmin botmark ${name} ${icon} clear`;
++  if (!target || !isUint32(target.entry) || !isUint32(target.unitId)) return null;
++  return `wowmin botmark ${name} ${icon} ${target.entry} ${target.unitId}`;
++}
++
++// "WBOTMARK|ok|<icon>|<entry>|<unitId>", "WBOTMARK|cleared|<icon>",
++// "WBOTMARK|refused|<reason>", "WBOTMARK|disabled"; anything else is an error.
++export function parseBotMarkReply(message: string): BotCommandResult {
++  const reply = message.split(/[\r\n]+/).map((line) => line.trim()).find((line) => line.startsWith('WBOTMARK|'));
++  if (!reply) return { success: false, status: 'error', reply: message.trim() };
++  const [, status, ...rest] = reply.split('|');
++  if (status === 'ok' && rest.length >= 3) return { success: true, status: 'ok', reply, command: `mark ${rest.join(' ')}` };
++  if (status === 'cleared' && rest.length >= 1) return { success: true, status: 'ok', reply, command: `clear ${rest[0]}` };
++  if (status === 'refused') return { success: false, status: 'refused', reply, reason: rest.join('|') };
++  if (status === 'disabled') return { success: false, status: 'disabled', reply };
++  return { success: false, status: 'error', reply };
++}
++
++export interface GroupPlayer {
++  name: string;
++  isBot: boolean;
++  accountId: number;
++  groupId?: number;
++  map: number;
++  position_x: number;
++  position_y: number;
++  position_z: number;
++}
++
++// The owner's character (the leader): the one real player on the owner's
++// account in view. A self-bot plays through the owner's own client, so the
++// telemetry does not count it as a bot.
++export function findGroupLeader<T extends GroupPlayer>(players: ReadonlyArray<T>, ownerAccountId: number): T | null {
++  if (!ownerAccountId) return null;
++  return players.find((player) => !player.isBot && player.accountId === ownerAccountId) ?? null;
++}
++
++// The bots in the leader's group.
++export function findGroupBots<T extends GroupPlayer>(players: ReadonlyArray<T>, leader: GroupPlayer | null): T[] {
++  if (!leader?.groupId) return [];
++  return players.filter((player) => player.isBot && player.groupId === leader.groupId && player.name !== leader.name);
++}
++
++export interface MarkableCreature {
++  guid: number;
++  entry: number;
++  x: number;
++  y: number;
++  z: number;
++  alive: boolean;
++  hostile: boolean;
++  playerControlled: boolean;
++  scenery?: boolean;
++}
++
++// Like Tab in game: the nearest live hostile creature to `from`, within
++// `maxYards`, leaving out scenery and players' pets.
++export function findNearestMarkable<T extends MarkableCreature>(
++  creatures: ReadonlyArray<T>,
++  from: { x: number; y: number; z: number },
++  maxYards: number,
++): T | null {
++  let best: T | null = null;
++  let bestDistance = maxYards;
++  for (const creature of creatures) {
++    if (!creature.alive || !creature.hostile || creature.playerControlled || creature.scenery) continue;
++    const distance = Math.hypot(creature.x - from.x, creature.y - from.y, creature.z - from.z);
++    if (distance <= bestDistance) {
++      best = creature;
++      bestDistance = distance;
++    }
++  }
++  return best;
++}
++
++// Where each of `count` bots goes round a squad move point: the point itself
++// for one, else a ring of `radius` yards, so they do not stand in each other.
++export function squadMovePoints(x: number, y: number, z: number, count: number, radius = 2.5): Array<[number, number, number]> {
++  if (count <= 1) return count === 1 ? [[x, y, z]] : [];
++  return Array.from({ length: count }, (_, index) => {
++    const angle = (index / count) * Math.PI * 2;
++    return [x + Math.cos(angle) * radius, y + Math.sin(angle) * radius, z];
++  });
++}
++
++// The world x / y under screen point (sx, sy) for a flat map projection
++// (affine in x and y at a given z); null when the projection is degenerate.
++export function invertFlatProjection(
++  worldToScreen: (x: number, y: number, z: number) => { x: number; y: number },
++  sx: number,
++  sy: number,
++  z: number,
++): { x: number; y: number } | null {
++  const origin = worldToScreen(0, 0, z);
++  const alongX = worldToScreen(100, 0, z);
++  const alongY = worldToScreen(0, 100, z);
++  const ax = (alongX.x - origin.x) / 100;
++  const ay = (alongX.y - origin.y) / 100;
++  const bx = (alongY.x - origin.x) / 100;
++  const by = (alongY.y - origin.y) / 100;
++  const determinant = ax * by - bx * ay;
++  if (!Number.isFinite(determinant) || Math.abs(determinant) < 1e-9) return null;
++  const dx = sx - origin.x;
++  const dy = sy - origin.y;
++  return { x: (dx * by - bx * dy) / determinant, y: (ax * dy - dx * ay) / determinant };
++}
+diff --git a/src/bot-command.ts b/src/bot-command.ts
+index 4e2b18a..0865beb 100644
+--- a/src/bot-command.ts
++++ b/src/bot-command.ts
+@@ -1,7 +1,7 @@
+ import * as fs from 'fs/promises';
+ import * as path from 'path';
+-import type { BotCommandResult, BotCommandSettings, BotCommandSource } from './types/api';
+-import { BOT_COMMAND_SOURCES, buildBotCommandLine, normalizeBotCommand, parseBotCommandReply, parseBotName } from './bot-command-rules';
++import type { BotCommandResult, BotCommandSettings, BotCommandSource, BotMarkTarget } from './types/api';
++import { BOT_COMMAND_SOURCES, buildBotCommandLine, buildBotMarkLine, normalizeBotCommand, parseBotCommandReply, parseBotMarkReply, parseBotName } from './bot-command-rules';
+ 
+ export * from './bot-command-rules';
+ 
+@@ -93,23 +93,38 @@ export class BotCommandSender {
+     const checked = checkBotCommandRequest(bot, command, source);
+     if ('refused' in checked) return checked.refused;
+     const { request } = checked;
++    return this.run(request.bot, request.command, request.source, buildBotCommandLine(request.bot, request.command),
++      parseBotCommandReply);
++  }
++
++  // A raid icon on a creature for the owner's group ("wowmin botmark"); a
++  // null target clears the icon. Logged with the player as "bot".
++  async mark(player: unknown, icon: unknown, target: BotMarkTarget | null, source: unknown): Promise<BotCommandResult> {
++    if (!(await this.isEnabled())) {
++      return { success: false, status: 'disabled', reply: '', reason: 'turned off in WoWMin' };
++    }
++    const line = buildBotMarkLine(player, icon, target);
++    if (!line) return { success: false, status: 'refused', reply: '', reason: 'not allowed' };
++    const knownSource = BOT_COMMAND_SOURCES.includes(source as BotCommandSource) ? source as BotCommandSource : 'group';
++    const name = line.split(' ')[2];
++    return this.run(name, `mark ${line.split(' ').slice(3).join(' ')}`, knownSource, line, parseBotMarkReply);
++  }
+ 
++  private async run(
++    bot: string,
++    command: string,
++    source: BotCommandSource,
++    line: string,
++    parse: (message: string) => BotCommandResult,
++  ): Promise<BotCommandResult> {
+     let result: BotCommandResult;
+     try {
+-      const response = await this.execute(buildBotCommandLine(request.bot, request.command));
+-      result = response.success
+-        ? parseBotCommandReply(response.message)
+-        : { success: false, status: 'error', reply: response.message };
++      const response = await this.execute(line);
++      result = response.success ? parse(response.message) : { success: false, status: 'error', reply: response.message };
+     } catch (err) {
+       result = { success: false, status: 'error', reply: err instanceof Error ? err.message : String(err) };
+     }
+-    await this.log({
+-      time: new Date(this.now()).toISOString(),
+-      bot: request.bot,
+-      command: request.command,
+-      reply: result.reply,
+-      source: request.source,
+-    });
++    await this.log({ time: new Date(this.now()).toISOString(), bot, command, reply: result.reply, source });
+     return result;
+   }
+ 
+diff --git a/src/types/api.ts b/src/types/api.ts
+index 844a1c7..fafc1cb 100644
+--- a/src/types/api.ts
++++ b/src/types/api.ts
+@@ -794,8 +794,8 @@ export interface SoapResult {
+ }
+ 
+ // Bot control: a playerbot command sent through "wowmin botcmd".
+-export type BotCommandKind = 'self' | 'master' | 'strategy';
+-export type BotCommandSource = 'button' | 'text' | 'suggestion';
++export type BotCommandKind = 'self' | 'master' | 'strategy' | 'move';
++export type BotCommandSource = 'button' | 'text' | 'suggestion' | 'group';
+ 
+ export interface BotCommandResult {
+   success: boolean;
+@@ -807,6 +807,13 @@ export interface BotCommandResult {
+   reason?: string;
+ }
+ 
++// A creature for "wowmin botmark": its entry and the stream's unit id
++// (StreamCreatureSample.guid).
++export interface BotMarkTarget {
++  entry: number;
++  unitId: number;
++}
++
+ export interface BotCommandSettings {
+   // WoWMin's off switch; the module has its own (BotCommand.Enable).
+   enabled: boolean;
+@@ -955,6 +962,7 @@ export type ApiChannels = {
+   'sessions:setRecordingEnabled': (enabled: boolean) => boolean;
+   'sessions:purgeCompleted': () => number;
+   'bots:command': (bot: string, command: string, source?: BotCommandSource) => BotCommandResult;
++  'bots:mark': (player: string, icon: string, target: BotMarkTarget | null, source?: BotCommandSource) => BotCommandResult;
+   'bots:getCommandSettings': () => BotCommandSettings;
+   'bots:setCommandEnabled': (enabled: boolean) => BotCommandSettings;
+ 
+-- 
+2.56.0.windows.2
+

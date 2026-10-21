@@ -1,0 +1,576 @@
+From 2a2013404bbea2cdf1ae90a4859ff990a491a9b1 Mon Sep 17 00:00:00 2001
+From: astrangedaytoday15-dev <342675337+astrangedaytoday15-dev@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 03:12:47 -0400
+Subject: [PATCH 3/4] World 3D S4: Live Map follow panel and overlay
+
+- Live Map: "3D" on the selected player opens World 3D over the map:
+  the open world's tiles round that unit (WorldFollowWindow, at most two
+  loading), drawn by InstanceSceneView with Instance Watch's lighting,
+  plate style and render scale; follows the unit at 30 fps from the 1 s
+  positions (polled while open, whatever Auto says).
+- Overlay: a marker per unit in view (followed one ringed), nameplates
+  (or name labels), the selected bot's waypoint as a dashed line, and
+  trails of where units have been while the view was open (WorldTrails).
+- Controls: Q / E and buttons rotate, scroll and buttons zoom (30-480 yd
+  round the unit), Trails toggle, Esc or x closes; picking another
+  continent closes it. A unit gone from the map shown is followed to its
+  continent, or the status says it is offline or in an instance.
+- Tests for trails.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ renderer/index.html                    |  16 ++
+ renderer/scripts/app.ts                | 345 +++++++++++++++++++++++++
+ renderer/scripts/utils/world-window.ts |  40 +++
+ renderer/styles.css                    |  51 ++++
+ scripts/test-world-tiles.cjs           |  19 ++
+ 5 files changed, 471 insertions(+)
+
+diff --git a/renderer/index.html b/renderer/index.html
+index 39cf95a..2440db6 100644
+--- a/renderer/index.html
++++ b/renderer/index.html
+@@ -1141,6 +1141,21 @@ SELECT * FROM creature_template WHERE entry = 1;" spellcheck="false"></textarea>
+           <div id="map-interaction-hint" class="map-interaction-hint">Double-click or scroll to zoom • drag to pan</div>
+           <canvas id="map-canvas"></canvas>
+           <div id="map-tooltip" class="map-tooltip hidden"></div>
++          <!-- World 3D: the open world in 3D round one followed unit -->
++          <div id="world3d-panel" class="world3d-panel" hidden>
++            <canvas id="world3d-scene" class="world3d-layer"></canvas>
++            <canvas id="world3d-overlay" class="world3d-layer" tabindex="0" aria-label="World 3D view: Q and E rotate, scroll zooms"></canvas>
++            <div class="world3d-toolbar">
++              <span id="world3d-title" class="world3d-title"></span>
++              <button id="world3d-rotate-left-btn" class="btn btn-tiny" title="Rotate left (Q)">&#10226;</button>
++              <button id="world3d-rotate-right-btn" class="btn btn-tiny" title="Rotate right (E)">&#10227;</button>
++              <button id="world3d-zoom-out-btn" class="btn btn-tiny" title="Zoom out">&minus;</button>
++              <button id="world3d-zoom-in-btn" class="btn btn-tiny" title="Zoom in">+</button>
++              <button id="world3d-trails-btn" class="btn btn-tiny" aria-pressed="true" title="Trails">Trails</button>
++              <button id="world3d-close-btn" class="btn btn-tiny" title="Back to the map">&times;</button>
++            </div>
++            <div id="world3d-status" class="world3d-status"></div>
++          </div>
+         </div>
+ 
+         <!-- Selected player panel -->
+@@ -1153,6 +1168,7 @@ SELECT * FROM creature_template WHERE entry = 1;" spellcheck="false"></textarea>
+             <span id="map-sel-waypoint" class="map-sel-waypoint"></span>
+           </div>
+           <div class="map-sel-actions">
++            <button id="map-world3d-btn" class="btn btn-tiny" title="Follow in 3D">3D</button>
+             <button class="btn btn-tiny map-action-btn" data-map-action="pinfo">&#8505; Info</button>
+             <button class="btn btn-tiny map-action-btn" data-map-action="freeze">&#10052; Freeze</button>
+             <button class="btn btn-tiny map-action-btn" data-map-action="unfreeze">&#128275; Unfreeze</button>
+diff --git a/renderer/scripts/app.ts b/renderer/scripts/app.ts
+index e57990c..7fc0ff7 100644
+--- a/renderer/scripts/app.ts
++++ b/renderer/scripts/app.ts
+@@ -16,6 +16,7 @@ import { SpellNames } from './utils/spell-names';
+ import { applyLiveSample, creaturePathKey, getMountModelUrl, getUnitModelUrl, LiveAppearanceStore, LiveAuraStore, LiveDebuffStore, LiveGameObjectStore, LiveMarkerStore, LivePassengerStore, LiveBotStore, LiveCreatureBuffer, LivePathStore, LivePositionBuffer, trimPathToPosition } from './utils/live-positions';
+ import { getCreatureCombatStyle, getPlayerCombatStyle } from './utils/unit-animation';
+ import { CONTINENT_BOUNDS, worldToCanvas } from './utils/map-coords';
++import { WorldFollowWindow, WorldTrails, worldTilesToLoad, type WorldPoint } from './utils/world-window';
+ import { getEnglishMotd, getServerUptime } from './utils/dashboard-data';
+ import { calculateSessionTotalsAt, formatSessionReplayTime, isSessionRouteDiscontinuity } from './utils/session-replay';
+ import { getClassIconHtml, getClassIconImage, getPlayerStateIconsHtml, getPlayerStateIndicators, getRacePortraitHtml, getResponsivePlayerIconScale, getStateIconImage, loadPlayerIconManifest } from './utils/player-icons';
+@@ -5830,6 +5831,7 @@ async function refreshMapPositions(): Promise<void> {
+       mapAllPlayers = snapshot.players;
+       mapMovementStartedAt = performance.now();
+       animateMapMovement();
++      onWorld3dPositions();
+       if ($mapStatusText) {
+         const source = snapshot.source === 'worldserver' ? 'LIVE world state' : 'DB fallback (saved positions)';
+         $mapStatusText.textContent = `${source} • ${mapMovingPlayers.size} moving • ${new Date(snapshot.capturedAt).toLocaleTimeString()}`;
+@@ -6349,6 +6351,7 @@ $$<HTMLButtonElement>('.map-continent-btn').forEach((btn) => {
+   btn.addEventListener('click', () => {
+     $$<HTMLButtonElement>('.map-continent-btn').forEach((b) => b.classList.remove('active'));
+     btn.classList.add('active');
++    if (world3dName) closeWorld3d();
+     state.mapSelectedContinent = Number(btn.dataset.continent ?? '0');
+     preloadMapImage(state.mapSelectedContinent);
+     resetMapZoom(false);
+@@ -9787,6 +9790,348 @@ if (sessionReplayCanvasWrapper) sessionReplayResizeObserver.observe(sessionRepla
+ renderSessionReplay();
+ void refreshSessionHistory();
+ 
++// ═══════════════════════════════════════════════════════════════════════════
++// WORLD 3D (Live Map: the open world in 3D round one followed unit)
++// ═══════════════════════════════════════════════════════════════════════════
++
++// The open world's tiles round the unit (scripts/scene/export-tile.mjs),
++// built by the web service on first ask, drawn by the instance scene viewer,
++// with the Live Map's 1 s positions over them. The window is
++// WORLD3D_TILES x WORLD3D_TILES tiles; the camera frames WORLD3D_RADIUS
++// yards round the unit, which the window always covers.
++const $world3dPanel = $<HTMLElement>('world3d-panel');
++const $world3dScene = $<HTMLCanvasElement>('world3d-scene');
++const $world3dOverlay = $<HTMLCanvasElement>('world3d-overlay');
++const $world3dTitle = $<HTMLElement>('world3d-title');
++const $world3dStatus = $<HTMLElement>('world3d-status');
++const $world3dTrailsBtn = $<HTMLButtonElement>('world3d-trails-btn');
++const WORLD3D_TILES = 3;
++const WORLD3D_RADIUS_DEFAULT = 140;
++const WORLD3D_RADIUS_MIN = 30;
++const WORLD3D_RADIUS_MAX = 480;
++const WORLD3D_ZOOM_STEP = 1.2;
++// Heights framed above and below the unit.
++const WORLD3D_HEIGHT = 50;
++// Units further than this beyond the framed radius are not drawn.
++const WORLD3D_UNIT_MARGIN = 40;
++const WORLD3D_FRAME_MS = 1000 / 30;
++const WORLD3D_CONTINENTS = new Set([0, 1, 530, 571]);
++
++let world3dName: string | null = null;
++let world3dSceneView: InstanceSceneView | null | undefined;
++const world3dFollow = new WorldFollowWindow(WORLD3D_TILES);
++const world3dTrails = new WorldTrails();
++let world3dYaw = DEFAULT_ISO_YAW;
++let world3dRadius = WORLD3D_RADIUS_DEFAULT;
++let world3dShowTrails = true;
++let world3dFrame: number | null = null;
++let world3dLastDraw = 0;
++let world3dPoll: ReturnType<typeof setInterval> | null = null;
++// Why the unit is not drawn (offline, in an instance), or null.
++let world3dAway: string | null = null;
++
++function getWorld3dSceneView(): InstanceSceneView | null {
++  if (world3dSceneView === undefined) {
++    world3dSceneView = $world3dScene && InstanceSceneView.isSupported()
++      ? new InstanceSceneView($world3dScene, () => { world3dLastDraw = 0; })
++      : null;
++  }
++  return world3dSceneView?.available ? world3dSceneView : null;
++}
++
++function world3dTileUrl(path: string): string {
++  return new URL(path, window.location.href).href;
++}
++
++// The unit's position, sliding from its last sample as the Live Map's do.
++function getWorld3dPosition(player: MapPlayerPosition): WorldPoint {
++  const previous = mapPreviousPositions.get(player.name);
++  if (!previous || !mapMovementStartedAt) return [player.position_x, player.position_y, player.position_z];
++  const progress = Math.min(1, Math.max(0, (performance.now() - mapMovementStartedAt) / MAP_MOVEMENT_ANIMATION_MS));
++  return [
++    previous.position_x + (player.position_x - previous.position_x) * progress,
++    previous.position_y + (player.position_y - previous.position_y) * progress,
++    previous.position_z + (player.position_z - previous.position_z) * progress,
++  ];
++}
++
++function openWorld3d(name: string): void {
++  if (!$world3dPanel || !getWorld3dSceneView()) {
++    if ($world3dStatus) $world3dStatus.textContent = 'World 3D needs WebGL 2.';
++    return;
++  }
++  if (world3dName !== name) {
++    closeWorld3dTiles();
++    world3dTrails.clear();
++  }
++  world3dName = name;
++  world3dAway = null;
++  $world3dPanel.hidden = false;
++  if ($world3dTitle) $world3dTitle.textContent = name;
++  // Positions every second while the view is open, whatever Auto says.
++  if (!world3dPoll) world3dPoll = setInterval(() => { if (getActiveMainTabId() === 'map') void refreshMapPositions(); }, 1000);
++  $world3dOverlay?.focus();
++  world3dLastDraw = 0;
++  scheduleWorld3dFrame();
++}
++
++function closeWorld3dTiles(): void {
++  const view = world3dSceneView;
++  for (const path of world3dFollow.clear()) view?.unload(world3dTileUrl(path));
++}
++
++function closeWorld3d(): void {
++  closeWorld3dTiles();
++  world3dTrails.clear();
++  world3dName = null;
++  if (world3dPoll) { clearInterval(world3dPoll); world3dPoll = null; }
++  if (world3dFrame !== null) { cancelAnimationFrame(world3dFrame); world3dFrame = null; }
++  if ($world3dPanel) $world3dPanel.hidden = true;
++  renderMapCanvas();
++}
++
++function scheduleWorld3dFrame(): void {
++  if (world3dFrame !== null) return;
++  world3dFrame = requestAnimationFrame((now) => {
++    world3dFrame = null;
++    if (!world3dName) return;
++    if (getActiveMainTabId() === 'map' && now - world3dLastDraw >= WORLD3D_FRAME_MS) {
++      world3dLastDraw = now;
++      renderWorld3d();
++    }
++    scheduleWorld3dFrame();
++  });
++}
++
++// After each Live Map refresh: trails for the units on the followed unit's
++// map, and a search for the unit when it has left the map shown.
++function onWorld3dPositions(): void {
++  if (!world3dName) return;
++  const player = mapAllPlayers.find((candidate) => candidate.name === world3dName);
++  if (!player) {
++    void findWorld3dUnit(world3dName);
++    return;
++  }
++  world3dAway = null;
++  const seen = new Set<string>();
++  for (const unit of mapAllPlayers) {
++    if (unit.map !== player.map) continue;
++    seen.add(unit.name);
++    world3dTrails.add(unit.name, unit.map, [unit.position_x, unit.position_y, unit.position_z]);
++  }
++  world3dTrails.retain(seen);
++}
++
++// The followed unit is not on the map shown: follow it to its continent, or
++// say where it is.
++let world3dSearching = false;
++async function findWorld3dUnit(name: string): Promise<void> {
++  if (world3dSearching) return;
++  world3dSearching = true;
++  try {
++    const snapshot = await window.wowminAPI.map.getPlayerPositions();
++    if (world3dName !== name) return;
++    const player = snapshot.players.find((candidate) => candidate.name === name);
++    if (!player) {
++      world3dAway = `${name} is offline`;
++    } else if (!WORLD3D_CONTINENTS.has(player.map)) {
++      world3dAway = `${name} is in ${getMapName(player.map)}: see Instance Watch`;
++    } else if (player.map !== state.mapSelectedContinent) {
++      world3dAway = null;
++      state.mapSelectedContinent = player.map;
++      $$<HTMLButtonElement>('.map-continent-btn').forEach((button) => {
++        button.classList.toggle('active', Number(button.dataset.continent) === player.map);
++      });
++      preloadMapImage(player.map);
++      resetMapZoom(false);
++      void refreshMapPositions();
++    }
++  } catch {
++    // Tried again on the next refresh.
++  } finally {
++    world3dSearching = false;
++  }
++}
++
++function renderWorld3d(): void {
++  const view = getWorld3dSceneView();
++  const wrapper = $world3dPanel;
++  if (!view || !wrapper || !$world3dScene || !$world3dOverlay || !world3dName) return;
++  const rect = wrapper.getBoundingClientRect();
++  const width = Math.floor(rect.width) || 800;
++  const height = Math.floor(rect.height) || 500;
++  if ($world3dOverlay.width !== width) $world3dOverlay.width = width;
++  if ($world3dOverlay.height !== height) $world3dOverlay.height = height;
++  const ctx = $world3dOverlay.getContext('2d');
++  if (!ctx) return;
++  ctx.clearRect(0, 0, width, height);
++
++  const player = mapAllPlayers.find((candidate) => candidate.name === world3dName);
++  if (!player) {
++    if ($world3dStatus) $world3dStatus.textContent = world3dAway ?? `Looking for ${world3dName}…`;
++    return;
++  }
++  const [x, y, z] = getWorld3dPosition(player);
++  const update = world3dFollow.update(player.map, x, y);
++  for (const path of update.drop) view.unload(world3dTileUrl(path));
++  const urls = update.paths.map(world3dTileUrl);
++  for (const url of worldTilesToLoad(urls, (candidate) => view.state(candidate))) view.load(url);
++
++  void loadInstanceMapLights(player.map);
++  view.setLighting(instanceMapLights.get(player.map) ?? null, instanceLighting, instanceObjectLights);
++  view.setRenderScale(instanceRenderScale);
++  const box: SceneBox = {
++    minX: x - world3dRadius, maxX: x + world3dRadius, minY: y - world3dRadius, maxY: y + world3dRadius,
++    minZ: z - WORLD3D_HEIGHT, maxZ: z + WORLD3D_HEIGHT,
++  };
++  const isoView = createIsoView(box, width, height, world3dYaw, ISO_PITCH, { zoom: 1, panX: 0, panY: 0 });
++  const drawn = view.render(urls, isoView, width, height, [], { height: WORLD3D_HEIGHT, horizontal: null, reach: null });
++  $world3dScene.hidden = !drawn;
++
++  const project = (point: WorldPoint) => isoView.projection.worldToScreen(point[0], point[1], point[2]);
++  const reach = world3dRadius * Math.SQRT2 + WORLD3D_UNIT_MARGIN;
++  const units = mapAllPlayers.filter((unit) => unit.map === player.map
++    && Math.hypot(unit.position_x - x, unit.position_y - y) <= reach);
++
++  if (world3dShowTrails) {
++    for (const unit of units) {
++      const trail = world3dTrails.get(unit.name, unit.map);
++      if (trail.length < 2) continue;
++      ctx.beginPath();
++      trail.forEach((point, index) => {
++        const screen = project(point);
++        if (index === 0) ctx.moveTo(screen.x, screen.y); else ctx.lineTo(screen.x, screen.y);
++      });
++      const position = unit.name === player.name ? [x, y, z] as WorldPoint : getWorld3dPosition(unit);
++      const head = project(position);
++      ctx.lineTo(head.x, head.y);
++      ctx.strokeStyle = CLASS_COLORS[unit.class] || '#94a3b8';
++      ctx.globalAlpha = unit.name === player.name ? 0.85 : 0.45;
++      ctx.lineWidth = unit.name === player.name ? 2.5 : 1.5;
++      ctx.stroke();
++      ctx.globalAlpha = 1;
++    }
++  }
++
++  // The followed bot's waypoint, as the Live Map shows it.
++  const waypoint = mapSelectedPlayerName === player.name && mapSelectedBotWaypoint?.map === player.map ? mapSelectedBotWaypoint : null;
++  if (waypoint) {
++    const from = project([x, y, z]);
++    const to = project([waypoint.x, waypoint.y, waypoint.z]);
++    ctx.save();
++    ctx.setLineDash([6, 5]);
++    ctx.strokeStyle = '#fcd34d';
++    ctx.lineWidth = 2;
++    ctx.beginPath();
++    ctx.moveTo(from.x, from.y);
++    ctx.lineTo(to.x, to.y);
++    ctx.stroke();
++    ctx.setLineDash([]);
++    ctx.fillStyle = '#fcd34d';
++    ctx.beginPath();
++    ctx.arc(to.x, to.y, 5, 0, Math.PI * 2);
++    ctx.fill();
++    ctx.font = '11px sans-serif';
++    ctx.fillText(`WP: ${waypoint.name}`, to.x + 8, to.y - 8);
++    ctx.restore();
++  }
++
++  const plateStyle = instancePlatesMode !== 'labels' ? instancePlatesMode : null;
++  const plates: Parameters<typeof drawInstancePlates>[2] = [];
++  for (const unit of units) {
++    const followed = unit.name === player.name;
++    const point = project(followed ? [x, y, z] : getWorld3dPosition(unit));
++    if (point.x < -50 || point.y < -50 || point.x > width + 50 || point.y > height + 50) continue;
++    const color = unit.alive ? CLASS_COLORS[unit.class] || '#4fc3f7' : '#94a3b8';
++    const radius = followed ? 7 : 5;
++    ctx.beginPath();
++    ctx.arc(point.x, point.y, radius, 0, Math.PI * 2);
++    ctx.fillStyle = color;
++    ctx.fill();
++    ctx.lineWidth = followed ? 3 : 1.5;
++    ctx.strokeStyle = followed ? '#ffffff' : 'rgba(0,0,0,0.75)';
++    ctx.stroke();
++    if (plateStyle) {
++      const level = unit.level || 1;
++      plates.push({
++        plate: {
++          name: unit.name,
++          level: String(level),
++          levelColor: levelColor(level, player.level || level),
++          elite: false,
++          boss: false,
++          healthPct: unit.alive ? unit.healthPct ?? 100 : 0,
++          barColor: CLASS_COLORS[unit.class] || '#94a3b8',
++          alive: unit.alive,
++          threat: unit.inCombat,
++          selected: followed,
++          cast: null,
++          note: null,
++          power: unit.alive && unit.powerPct !== undefined && POWER_COLORS[unit.powerType ?? -1]
++            ? { pct: unit.powerPct, color: POWER_COLORS[unit.powerType ?? 0] } : null,
++        },
++        x: point.x,
++        y: point.y - radius - 4,
++        priority: (followed ? 4 : 0) + (!isMapBot(unit) ? 2 : 0) + (unit.inCombat ? 1 : 0),
++        keep: followed,
++      });
++    } else {
++      ctx.font = followed ? 'bold 12px sans-serif' : '11px sans-serif';
++      ctx.fillStyle = '#e2e8f0';
++      ctx.fillText(unit.name, point.x + radius + 4, point.y + 4);
++    }
++  }
++  if (plateStyle) drawInstancePlates(ctx, plateStyle, plates, 1);
++
++  if ($world3dStatus) {
++    const ready = urls.filter((url) => view.state(url) === 'ready').length;
++    // A tile's first visit builds it on the web service (seconds each).
++    const loading = urls.filter((url) => view.state(url) === 'loading').length;
++    const waiting = urls.filter((url) => view.state(url) === undefined).length;
++    $world3dStatus.textContent = [
++      `${getMapName(player.map)} · tile ${update.centre.x},${update.centre.y}`,
++      `${ready}/${urls.length} tiles${loading ? ` · ${loading} loading` : ''}${waiting ? ` · ${waiting} queued` : ''}`,
++      `${units.length} in view · ${Math.round(world3dRadius * 2)} yd`,
++    ].join(' · ');
++  }
++}
++
++function zoomWorld3d(direction: 1 | -1): void {
++  world3dRadius = clamp(world3dRadius * (direction > 0 ? 1 / WORLD3D_ZOOM_STEP : WORLD3D_ZOOM_STEP), WORLD3D_RADIUS_MIN, WORLD3D_RADIUS_MAX);
++  world3dLastDraw = 0;
++}
++
++function rotateWorld3d(direction: 1 | -1): void {
++  world3dYaw = getNextQuarterTurn(world3dYaw, direction);
++  world3dLastDraw = 0;
++}
++
++$('map-world3d-btn')?.addEventListener('click', () => {
++  if (mapSelectedPlayerName) openWorld3d(mapSelectedPlayerName);
++});
++$('world3d-close-btn')?.addEventListener('click', () => closeWorld3d());
++$('world3d-rotate-left-btn')?.addEventListener('click', () => rotateWorld3d(-1));
++$('world3d-rotate-right-btn')?.addEventListener('click', () => rotateWorld3d(1));
++$('world3d-zoom-in-btn')?.addEventListener('click', () => zoomWorld3d(1));
++$('world3d-zoom-out-btn')?.addEventListener('click', () => zoomWorld3d(-1));
++$world3dTrailsBtn?.addEventListener('click', () => {
++  world3dShowTrails = !world3dShowTrails;
++  $world3dTrailsBtn.setAttribute('aria-pressed', String(world3dShowTrails));
++  world3dLastDraw = 0;
++});
++$world3dOverlay?.addEventListener('wheel', (event) => {
++  event.preventDefault();
++  zoomWorld3d(event.deltaY < 0 ? 1 : -1);
++}, { passive: false });
++$world3dOverlay?.addEventListener('keydown', (event) => {
++  if (event.altKey || event.ctrlKey || event.metaKey) return;
++  const key = event.key.toLowerCase();
++  if (key === 'escape') { event.preventDefault(); closeWorld3d(); return; }
++  if (key !== 'q' && key !== 'e') return;
++  event.preventDefault();
++  rotateWorld3d(key === 'q' ? -1 : 1);
++});
++
+ void loadPlayerIconManifest().then((loaded) => {
+   if (!loaded) return;
+   renderPlayersTable();
+diff --git a/renderer/scripts/utils/world-window.ts b/renderer/scripts/utils/world-window.ts
+index 16353c2..67d13cc 100644
+--- a/renderer/scripts/utils/world-window.ts
++++ b/renderer/scripts/utils/world-window.ts
+@@ -118,3 +118,43 @@ export class WorldFollowWindow {
+     return serverX >= box.minX - pad && serverX < box.maxX + pad && serverY >= box.minY - pad && serverY < box.maxY + pad;
+   }
+ }
++
++// Trails: where units in the view have been while it was open, a point each
++// time one has moved this far, the newest this many kept. A jump this far
++// (a teleport, a flight's end) or a map change starts a new trail.
++export const WORLD_TRAIL_STEP = 2;
++export const WORLD_TRAIL_POINTS = 240;
++export const WORLD_TRAIL_BREAK = 120;
++
++export type WorldPoint = [number, number, number];
++
++export class WorldTrails {
++  private readonly trails = new Map<string, { mapId: number; points: WorldPoint[] }>();
++
++  add(name: string, mapId: number, point: WorldPoint): void {
++    const trail = this.trails.get(name);
++    const last = trail?.points[trail.points.length - 1];
++    const distance = last ? Math.hypot(point[0] - last[0], point[1] - last[1], point[2] - last[2]) : Infinity;
++    if (!trail || trail.mapId !== mapId || distance > WORLD_TRAIL_BREAK) {
++      this.trails.set(name, { mapId, points: [point] });
++      return;
++    }
++    if (distance < WORLD_TRAIL_STEP) return;
++    trail.points.push(point);
++    if (trail.points.length > WORLD_TRAIL_POINTS) trail.points.splice(0, trail.points.length - WORLD_TRAIL_POINTS);
++  }
++
++  get(name: string, mapId: number): readonly WorldPoint[] {
++    const trail = this.trails.get(name);
++    return trail && trail.mapId === mapId ? trail.points : [];
++  }
++
++  // Forgets units no longer seen.
++  retain(names: ReadonlySet<string>): void {
++    for (const name of this.trails.keys()) if (!names.has(name)) this.trails.delete(name);
++  }
++
++  clear(): void {
++    this.trails.clear();
++  }
++}
+diff --git a/renderer/styles.css b/renderer/styles.css
+index e32efea..017f012 100644
+--- a/renderer/styles.css
++++ b/renderer/styles.css
+@@ -3571,6 +3571,57 @@ tbody tr:hover { background: var(--tint-accent-05); }
+   height: 100%;
+ }
+ 
++/* World 3D: covers the map while it follows a unit. */
++.world3d-panel {
++  position: absolute;
++  inset: 0;
++  z-index: 13;
++  background: #08111d;
++}
++
++.world3d-panel[hidden] { display: none; }
++
++.world3d-layer {
++  position: absolute;
++  inset: 0;
++  display: block;
++  width: 100%;
++  height: 100%;
++}
++
++.world3d-layer:focus { outline: none; }
++
++.world3d-toolbar {
++  position: absolute;
++  top: 10px;
++  right: 10px;
++  display: flex;
++  align-items: center;
++  gap: 6px;
++}
++
++.world3d-toolbar .btn { min-width: 32px; }
++.world3d-toolbar .btn[aria-pressed="false"] { opacity: 0.55; }
++
++.world3d-title {
++  font-weight: 600;
++  color: var(--accent-hover);
++  margin-right: 6px;
++}
++
++.world3d-status {
++  position: absolute;
++  left: 12px;
++  bottom: 12px;
++  padding: 6px 10px;
++  border: 1px solid rgba(255,255,255,0.08);
++  border-radius: 999px;
++  background: rgba(8, 17, 29, 0.78);
++  color: var(--text-muted);
++  font-size: 11px;
++  pointer-events: none;
++}
++
+ .map-tooltip {
+   position: absolute;
+   background: rgba(12, 12, 28, 0.96);
+diff --git a/scripts/test-world-tiles.cjs b/scripts/test-world-tiles.cjs
+index 6c2259e..e6ca3ea 100644
+--- a/scripts/test-world-tiles.cjs
++++ b/scripts/test-world-tiles.cjs
+@@ -174,3 +174,22 @@ test('tiles load a couple at a time, nearest first', () => {
+   states.set('b', 'failed').set('c', 'ready');
+   assert.deepEqual([...worldTilesToLoad(paths, state)], ['d']);
+ });
++
++test('trails keep a point per couple of yards and restart after a jump', () => {
++  const { WorldTrails, WORLD_TRAIL_POINTS } = loadModule('../renderer/scripts/utils/world-window.ts');
++  const trails = new WorldTrails();
++  trails.add('Darin', 0, [0, 0, 0]);
++  trails.add('Darin', 0, [1, 0, 0]);
++  assert.equal(trails.get('Darin', 0).length, 1);
++  trails.add('Darin', 0, [3, 0, 0]);
++  assert.equal(trails.get('Darin', 0).length, 2);
++  assert.equal(trails.get('Darin', 1).length, 0);
++  trails.add('Darin', 0, [500, 0, 0]);
++  assert.equal(trails.get('Darin', 0).length, 1);
++  for (let step = 1; step <= WORLD_TRAIL_POINTS + 10; step += 1) trails.add('Darin', 0, [500 + step * 3, 0, 0]);
++  assert.equal(trails.get('Darin', 0).length, WORLD_TRAIL_POINTS);
++  trails.add('Morl', 0, [0, 0, 0]);
++  trails.retain(new Set(['Morl']));
++  assert.equal(trails.get('Darin', 0).length, 0);
++  assert.equal(trails.get('Morl', 0).length, 1);
++});

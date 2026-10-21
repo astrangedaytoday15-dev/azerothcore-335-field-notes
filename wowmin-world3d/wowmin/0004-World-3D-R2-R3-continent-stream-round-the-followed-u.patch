@@ -1,0 +1,671 @@
+From a5beab590c42200e2aea1dee060c412fc37da9a8 Mon Sep 17 00:00:00 2001
+From: astrangedaytoday15-dev <342675337+astrangedaytoday15-dev@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 03:48:34 -0400
+Subject: [PATCH 4/4] World 3D R2 + R3: continent stream round the followed
+ unit, models and NPCs
+
+Needs mod-wowmin-telemetry with the continent radius stream
+("wowmin stream <map> 0 <player> <yards>"); without it World 3D keeps
+markers and says the models are unavailable.
+
+- R2: TelemetryStream.watch takes a follow (player, radius) for instance 0
+  and renews with the radius form; one stream per continent, the latest
+  watcher wins. /api/stream accepts instance=0 with unit and radius,
+  checked by parseStreamFollow (letters-only name, 10-250 yd) as they go
+  into a console command. streamPositions passes them on.
+- R3: World 3D opens that stream for the followed unit (reopened on a new
+  unit, map or radius) into its own stores, and poses players and
+  creatures with Instance Watch's builder (getInstanceUnitPoses now takes
+  its stores; Instance Watch's are the default), with strikes, spell
+  effects and game objects. NPC nameplates from creature info; markers
+  only for units without a model yet. Radius picker 30 / 50 / 100 (a
+  player's view distance) / 250, default 30, remembered.
+- Closer zoom (16 yd across); the framed height shrinks with the zoom.
+- Tests: follow parsing and the subscribe commands.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ renderer/index.html                  |   6 +
+ renderer/scripts/app.ts              | 249 +++++++++++++++++++++++----
+ renderer/scripts/types/wowmin-api.ts |   6 +-
+ renderer/scripts/web-api.ts          |   5 +-
+ renderer/styles.css                  |  10 ++
+ scripts/test-telemetry-stream.cjs    |  31 +++-
+ src/telemetry-stream.ts              |  35 +++-
+ src/web-server.ts                    |  10 +-
+ 8 files changed, 309 insertions(+), 43 deletions(-)
+
+diff --git a/renderer/index.html b/renderer/index.html
+index 2440db6..8a74836 100644
+--- a/renderer/index.html
++++ b/renderer/index.html
+@@ -1151,6 +1151,12 @@ SELECT * FROM creature_template WHERE entry = 1;" spellcheck="false"></textarea>
+               <button id="world3d-rotate-right-btn" class="btn btn-tiny" title="Rotate right (E)">&#10227;</button>
+               <button id="world3d-zoom-out-btn" class="btn btn-tiny" title="Zoom out">&minus;</button>
+               <button id="world3d-zoom-in-btn" class="btn btn-tiny" title="Zoom in">+</button>
++              <select id="world3d-radius" class="world3d-select" title="Models, NPCs and combat within this many yards of the unit">
++                <option value="30">30 yd</option>
++                <option value="50">50 yd</option>
++                <option value="100">100 yd (view)</option>
++                <option value="250">250 yd (max)</option>
++              </select>
+               <button id="world3d-trails-btn" class="btn btn-tiny" aria-pressed="true" title="Trails">Trails</button>
+               <button id="world3d-close-btn" class="btn btn-tiny" title="Back to the map">&times;</button>
+             </div>
+diff --git a/renderer/scripts/app.ts b/renderer/scripts/app.ts
+index 7fc0ff7..50fef2e 100644
+--- a/renderer/scripts/app.ts
++++ b/renderer/scripts/app.ts
+@@ -7117,6 +7117,28 @@ function getCreatureMarkerColor(creature: StreamCreatureSample): string {
+       : creature.hostile ? '#ef4444' : '#facc15';
+ }
+ 
++// The stream stores a view poses its units from: Instance Watch's own, or
++// World 3D's (its stream round one followed unit).
++interface LiveUnitSources {
++  positions: LivePositionBuffer;
++  appearances: LiveAppearanceStore;
++  passengers: LivePassengerStore;
++  gameObjects: LiveGameObjectStore;
++  effects: CombatEffectStore;
++  selectedName: string | null;
++}
++
++function getInstanceLiveSources(): LiveUnitSources {
++  return {
++    positions: instanceLivePositions,
++    appearances: instanceLiveAppearances,
++    passengers: instanceLivePassengers,
++    gameObjects: instanceLiveGameObjects,
++    effects: instanceCombatEffects,
++    selectedName: selectedInstancePlayerName,
++  };
++}
++
+ // Players and creatures with a client model for their current look, posed
+ // from the stream.
+ function getInstanceUnitPoses(
+@@ -7126,22 +7148,23 @@ function getInstanceUnitPoses(
+   now: number,
+   strikes: ReadonlyMap<UnitKey, StrikeKind>,
+   scenery: ReadonlySet<number>,
++  sources: LiveUnitSources = getInstanceLiveSources(),
+ ): UnitModelPose[] {
+   // Real attacks from the combat events.
+   const combat = (id: UnitKey) => ({
+     strike: strikes.get(id) ?? null,
+-    eventDriven: instanceCombatEffects.isEventDriven(id, now),
++    eventDriven: sources.effects.isEventDriven(id, now),
+   });
+   const poses: UnitModelPose[] = [];
+   const playersByGuid = new Map<number, MapPlayerPosition>();
+   for (const player of players) {
+-    const guid = instanceLivePositions.guidOf(player.name);
++    const guid = sources.positions.guidOf(player.name);
+     if (guid === null) continue;
+     playersByGuid.set(guid, player);
+-    const appearance = instanceLiveAppearances.get(false, guid, now);
++    const appearance = sources.appearances.get(false, guid, now);
+     const url = getUnitModelUrl(appearance);
+     // A passenger the client hides isn't drawn: the vehicle stands for them.
+-    const passenger = instanceLivePassengers.get(guid, now);
++    const passenger = sources.passengers.get(guid, now);
+     if (!appearance || !url || passenger?.hidden) continue;
+     poses.push({
+       id: unitKey(guid, false),
+@@ -7170,16 +7193,16 @@ function getInstanceUnitPoses(
+       marker: {
+         color: player.alive ? getInstancePlayerColor(player) : '#475569',
+         inCombat: player.inCombat,
+-        selected: player.name === selectedInstancePlayerName,
++        selected: player.name === sources.selectedName,
+         healthPct: null,
+         hidden: Boolean(passenger),
+       },
+     });
+   }
+   // Vehicles players ride aren't pets, whatever their size.
+-  const vehicles = instanceLivePassengers.vehicles(now);
++  const vehicles = sources.passengers.vehicles(now);
+   for (const creature of creatures) {
+-    const appearance = instanceLiveAppearances.get(true, creature.guid, now);
++    const appearance = sources.appearances.get(true, creature.guid, now);
+     const url = getUnitModelUrl(appearance);
+     if (!appearance || !url) continue;
+     const target = creature.targetIsPlayer ? playersByGuid.get(creature.targetGuid) : undefined;
+@@ -7214,8 +7237,8 @@ function getInstanceUnitPoses(
+ 
+ // The streamed game objects to draw: an open door goes (it has swung or slid
+ // out of the way); the rest stand where the server put them, turned about Z.
+-function getInstanceGameObjectPoses(now: number): GameObjectPose[] {
+-  return instanceLiveGameObjects.all(now)
++function getInstanceGameObjectPoses(now: number, store: LiveGameObjectStore = instanceLiveGameObjects): GameObjectPose[] {
++  return store.all(now)
+     .filter((object) => !(object.type === GAMEOBJECT_TYPE_DOOR && object.state === GO_STATE_ACTIVE))
+     .map((object) => ({
+       guid: object.guid,
+@@ -9807,10 +9830,12 @@ const $world3dStatus = $<HTMLElement>('world3d-status');
+ const $world3dTrailsBtn = $<HTMLButtonElement>('world3d-trails-btn');
+ const WORLD3D_TILES = 3;
+ const WORLD3D_RADIUS_DEFAULT = 140;
+-const WORLD3D_RADIUS_MIN = 30;
++const WORLD3D_RADIUS_MIN = 8;
+ const WORLD3D_RADIUS_MAX = 480;
+ const WORLD3D_ZOOM_STEP = 1.2;
+-// Heights framed above and below the unit.
++// Heights framed above and below the unit: at most this, and less up close
++// (half the radius), or the height would set the framing and zooming in
++// would hardly enlarge anything.
+ const WORLD3D_HEIGHT = 50;
+ // Units further than this beyond the framed radius are not drawn.
+ const WORLD3D_UNIT_MARGIN = 40;
+@@ -9829,6 +9854,25 @@ let world3dLastDraw = 0;
+ let world3dPoll: ReturnType<typeof setInterval> | null = null;
+ // Why the unit is not drawn (offline, in an instance), or null.
+ let world3dAway: string | null = null;
++// The module's stream round the followed unit (mod-wowmin-telemetry with our
++// radius patch): models, NPCs, combat, within this many yards of it; 100 is
++// a player's own view distance on this server, 250 the module's limit.
++const WORLD3D_STREAM_RADII = [30, 50, 100, 250];
++const WORLD3D_STREAM_RADIUS_STORAGE_KEY = 'wowmin.world3dStreamRadius';
++let world3dStreamRadius = ((): number => {
++  const stored = Number(readStoredSetting(WORLD3D_STREAM_RADIUS_STORAGE_KEY));
++  return WORLD3D_STREAM_RADII.includes(stored) ? stored : WORLD3D_STREAM_RADII[0];
++})();
++const world3dLive = {
++  positions: new LivePositionBuffer(),
++  creatures: new LiveCreatureBuffer(),
++  appearances: new LiveAppearanceStore(),
++  passengers: new LivePassengerStore(),
++  gameObjects: new LiveGameObjectStore(),
++  auras: new LiveAuraStore(),
++  effects: new CombatEffectStore(),
++};
++let world3dStream: { key: string; stop: () => void; status: StreamStatus } | null = null;
+ 
+ function getWorld3dSceneView(): InstanceSceneView | null {
+   if (world3dSceneView === undefined) {
+@@ -9884,6 +9928,7 @@ function closeWorld3d(): void {
+   closeWorld3dTiles();
+   world3dTrails.clear();
+   world3dName = null;
++  syncWorld3dStream(null);
+   if (world3dPoll) { clearInterval(world3dPoll); world3dPoll = null; }
+   if (world3dFrame !== null) { cancelAnimationFrame(world3dFrame); world3dFrame = null; }
+   if ($world3dPanel) $world3dPanel.hidden = true;
+@@ -9953,6 +9998,36 @@ async function findWorld3dUnit(name: string): Promise<void> {
+   }
+ }
+ 
++// Opens the stream round the followed unit (its continent, name, and the
++// radius chosen), reopening it when any of these change; closes it with null.
++// Needs the console (SOAP) connection, as Instance Watch's does.
++function syncWorld3dStream(player: MapPlayerPosition | null): void {
++  const wanted = player && world3dName && state.connected && WORLD3D_CONTINENTS.has(player.map)
++    ? `${player.map}:${player.name}:${world3dStreamRadius}` : null;
++  if ((world3dStream?.key ?? null) === wanted) return;
++  world3dStream?.stop();
++  world3dStream = null;
++  for (const store of Object.values(world3dLive)) store.clear();
++  if (!wanted || !player) return;
++  const stream: { key: string; stop: () => void; status: StreamStatus } = { key: wanted, stop: () => {}, status: 'starting' };
++  const current = () => world3dStream === stream;
++  stream.stop = window.wowminAPI.map.streamPositions(player.map, 0, {
++    onFrame: (frame) => { if (current()) world3dLive.positions.push(frame, performance.now()); },
++    onStatus: (status) => { if (current()) stream.status = status; },
++    onCreatures: (update) => {
++      if (!current()) return;
++      world3dLive.creatures.push(update, performance.now());
++      requestInstanceCreatureInfo(update.creatures.map((creature) => creature.entry));
++    },
++    onAppearances: (update) => { if (current()) world3dLive.appearances.push(update, performance.now()); },
++    onPassengers: (update) => { if (current()) world3dLive.passengers.push(update, performance.now()); },
++    onGameObjects: (update) => { if (current()) world3dLive.gameObjects.push(update, performance.now()); },
++    onUnitAuras: (update) => { if (current()) world3dLive.auras.push(update, performance.now()); },
++    onCombatEvents: (update) => { if (current()) world3dLive.effects.push(update, performance.now()); },
++  }, { name: player.name, radius: world3dStreamRadius });
++  world3dStream = stream;
++}
++
+ function renderWorld3d(): void {
+   const view = getWorld3dSceneView();
+   const wrapper = $world3dPanel;
+@@ -9966,32 +10041,83 @@ function renderWorld3d(): void {
+   if (!ctx) return;
+   ctx.clearRect(0, 0, width, height);
+ 
+-  const player = mapAllPlayers.find((candidate) => candidate.name === world3dName);
++  const player = mapAllPlayers.find((candidate) => candidate.name === world3dName) ?? null;
++  syncWorld3dStream(player);
+   if (!player) {
+     if ($world3dStatus) $world3dStatus.textContent = world3dAway ?? `Looking for ${world3dName}…`;
+     return;
+   }
+-  const [x, y, z] = getWorld3dPosition(player);
++  // With the stream, units move at its rate; otherwise they slide between
++  // the Live Map's 1 s positions.
++  const now = performance.now();
++  const live = world3dLive.positions.isActive(now);
++  const positionOf = (unit: MapPlayerPosition): WorldPoint => {
++    const sample = live ? world3dLive.positions.sampleAt(unit.name, now) : null;
++    return sample ? [sample.x, sample.y, sample.z] : getWorld3dPosition(unit);
++  };
++  const [x, y, z] = positionOf(player);
+   const update = world3dFollow.update(player.map, x, y);
+   for (const path of update.drop) view.unload(world3dTileUrl(path));
+   const urls = update.paths.map(world3dTileUrl);
+   for (const url of worldTilesToLoad(urls, (candidate) => view.state(candidate))) view.load(url);
+ 
++  const reach = world3dRadius * Math.SQRT2 + WORLD3D_UNIT_MARGIN;
++  const units = mapAllPlayers.filter((unit) => unit.map === player.map
++    && Math.hypot(unit.position_x - x, unit.position_y - y) <= reach);
++  const livePlayers: MapPlayerPosition[] = [];
++  if (live) {
++    for (const unit of units) {
++      const sample = world3dLive.positions.sampleAt(unit.name, now);
++      if (sample) livePlayers.push(applyLiveSample(unit, sample));
++    }
++  }
++  const creatures = live
++    ? world3dLive.creatures.samples(now).filter((creature) => Math.hypot(creature.x - x, creature.y - y) <= reach) : [];
++  const scenery = new Set(creatures.filter((creature) => {
++    const info = instanceCreatureInfo.get(creature.entry);
++    return isSceneryCreature(creature, info, isBossCreature(creature, info));
++  }).map((creature) => creature.guid));
++  const combatPositions = new Map<UnitKey, Point3>();
++  for (const unit of livePlayers) {
++    const guid = world3dLive.positions.guidOf(unit.name);
++    if (guid !== null) combatPositions.set(unitKey(guid, false), [unit.position_x, unit.position_y, unit.position_z]);
++  }
++  for (const creature of creatures) combatPositions.set(unitKey(creature.guid, true), [creature.x, creature.y, creature.z]);
++  const strikes = new Map(live ? world3dLive.effects.advance(now, (from, to) => {
++    const start = combatPositions.get(from);
++    const end = combatPositions.get(to);
++    return start && end ? Math.hypot(end[0] - start[0], end[1] - start[1], end[2] - start[2]) : null;
++  }).map((cue) => [cue.unit, cue.kind] as const) : []);
++  const sources: LiveUnitSources = {
++    positions: world3dLive.positions,
++    appearances: world3dLive.appearances,
++    passengers: world3dLive.passengers,
++    gameObjects: world3dLive.gameObjects,
++    effects: world3dLive.effects,
++    selectedName: player.name,
++  };
++
++  // Models are placed before the scene draws; units without one get markers.
+   void loadInstanceMapLights(player.map);
+   view.setLighting(instanceMapLights.get(player.map) ?? null, instanceLighting, instanceObjectLights);
+   view.setRenderScale(instanceRenderScale);
++  const modelIds = view.setUnits(live ? getInstanceUnitPoses(livePlayers, creatures, new Map(), now, strikes, scenery, sources) : [], now);
++  view.setEffects(live ? world3dLive.effects : null, combatPositions, now, live ? world3dLive.auras.all(now) : undefined,
++    (spellId) => instanceSpellNames.isTaunt(spellId));
++  view.setGameObjects(live ? getInstanceGameObjectPoses(now, world3dLive.gameObjects) : [], now);
+   const box: SceneBox = {
+     minX: x - world3dRadius, maxX: x + world3dRadius, minY: y - world3dRadius, maxY: y + world3dRadius,
+-    minZ: z - WORLD3D_HEIGHT, maxZ: z + WORLD3D_HEIGHT,
++    minZ: z - Math.min(WORLD3D_HEIGHT, world3dRadius / 2), maxZ: z + Math.min(WORLD3D_HEIGHT, world3dRadius / 2),
+   };
+   const isoView = createIsoView(box, width, height, world3dYaw, ISO_PITCH, { zoom: 1, panX: 0, panY: 0 });
+   const drawn = view.render(urls, isoView, width, height, [], { height: WORLD3D_HEIGHT, horizontal: null, reach: null });
+   $world3dScene.hidden = !drawn;
+ 
+   const project = (point: WorldPoint) => isoView.projection.worldToScreen(point[0], point[1], point[2]);
+-  const reach = world3dRadius * Math.SQRT2 + WORLD3D_UNIT_MARGIN;
+-  const units = mapAllPlayers.filter((unit) => unit.map === player.map
+-    && Math.hypot(unit.position_x - x, unit.position_y - y) <= reach);
++  const modelled = (unit: MapPlayerPosition) => {
++    const guid = live ? world3dLive.positions.guidOf(unit.name) : null;
++    return guid !== null && modelIds.has(unitKey(guid, false));
++  };
+ 
+   if (world3dShowTrails) {
+     for (const unit of units) {
+@@ -10002,8 +10128,7 @@ function renderWorld3d(): void {
+         const screen = project(point);
+         if (index === 0) ctx.moveTo(screen.x, screen.y); else ctx.lineTo(screen.x, screen.y);
+       });
+-      const position = unit.name === player.name ? [x, y, z] as WorldPoint : getWorld3dPosition(unit);
+-      const head = project(position);
++      const head = project(positionOf(unit));
+       ctx.lineTo(head.x, head.y);
+       ctx.strokeStyle = CLASS_COLORS[unit.class] || '#94a3b8';
+       ctx.globalAlpha = unit.name === player.name ? 0.85 : 0.45;
+@@ -10038,19 +10163,66 @@ function renderWorld3d(): void {
+ 
+   const plateStyle = instancePlatesMode !== 'labels' ? instancePlatesMode : null;
+   const plates: Parameters<typeof drawInstancePlates>[2] = [];
++  const onCanvas = (point: { x: number; y: number }) => point.x >= -50 && point.y >= -50 && point.x <= width + 50 && point.y <= height + 50;
++  // NPCs and mobs: a marker until their model is in; plates for the living
++  // that are not scenery (in combat ones kept over the rest).
++  for (const creature of [...creatures].sort((left, right) => Number(left.alive) - Number(right.alive))) {
++    const info = instanceCreatureInfo.get(creature.entry);
++    const key = unitKey(creature.guid, true);
++    const model = modelIds.has(key);
++    const point = project([creature.x, creature.y, creature.z]);
++    if (!onCanvas(point)) continue;
++    const isScenery = scenery.has(creature.guid);
++    if (!model) drawInstanceCreature(ctx, creature, info, point, 1, isScenery);
++    if (!info || !creature.alive || isScenery) continue;
++    const boss = isBossCreature(creature, info);
++    const top = model ? project([creature.x, creature.y, creature.z + INSTANCE_CREATURE_MODEL_HEIGHT]).y - 2 : point.y - 10;
++    if (plateStyle) {
++      plates.push({
++        plate: {
++          name: info.name,
++          level: String(info.maxLevel),
++          levelColor: levelColor(info.maxLevel, player.level || info.maxLevel),
++          elite: info.rank === 1 || info.rank === 2,
++          boss,
++          healthPct: creature.healthPct,
++          barColor: creature.playerControlled ? INSTANCE_PLATE_FRIENDLY_COLOR
++            : creature.hostile ? INSTANCE_PLATE_HOSTILE_COLOR : INSTANCE_PLATE_NEUTRAL_COLOR,
++          alive: true,
++          threat: creature.inCombat && creature.targetIsPlayer,
++          selected: false,
++          cast: null,
++          note: null,
++        },
++        x: point.x,
++        y: top,
++        priority: boss ? 1 : creature.inCombat ? 0 : -1,
++        keep: boss || creature.inCombat,
++        size: creature.playerControlled ? INSTANCE_PET_PLATE_SIZE : 1,
++      });
++    } else {
++      ctx.font = '10px sans-serif';
++      ctx.fillStyle = '#cbd5e1';
++      ctx.fillText(info.name, point.x + 6, top);
++    }
++  }
+   for (const unit of units) {
+     const followed = unit.name === player.name;
+-    const point = project(followed ? [x, y, z] : getWorld3dPosition(unit));
+-    if (point.x < -50 || point.y < -50 || point.x > width + 50 || point.y > height + 50) continue;
+-    const color = unit.alive ? CLASS_COLORS[unit.class] || '#4fc3f7' : '#94a3b8';
++    const position = positionOf(unit);
++    const point = project(position);
++    if (!onCanvas(point)) continue;
++    const model = modelled(unit);
+     const radius = followed ? 7 : 5;
+-    ctx.beginPath();
+-    ctx.arc(point.x, point.y, radius, 0, Math.PI * 2);
+-    ctx.fillStyle = color;
+-    ctx.fill();
+-    ctx.lineWidth = followed ? 3 : 1.5;
+-    ctx.strokeStyle = followed ? '#ffffff' : 'rgba(0,0,0,0.75)';
+-    ctx.stroke();
++    if (!model) {
++      ctx.beginPath();
++      ctx.arc(point.x, point.y, radius, 0, Math.PI * 2);
++      ctx.fillStyle = unit.alive ? CLASS_COLORS[unit.class] || '#4fc3f7' : '#94a3b8';
++      ctx.fill();
++      ctx.lineWidth = followed ? 3 : 1.5;
++      ctx.strokeStyle = followed ? '#ffffff' : 'rgba(0,0,0,0.75)';
++      ctx.stroke();
++    }
++    const top = model ? project([position[0], position[1], position[2] + INSTANCE_CREATURE_MODEL_HEIGHT]).y - 2 : point.y - radius - 4;
+     if (plateStyle) {
+       const level = unit.level || 1;
+       plates.push({
+@@ -10071,14 +10243,14 @@ function renderWorld3d(): void {
+             ? { pct: unit.powerPct, color: POWER_COLORS[unit.powerType ?? 0] } : null,
+         },
+         x: point.x,
+-        y: point.y - radius - 4,
++        y: top,
+         priority: (followed ? 4 : 0) + (!isMapBot(unit) ? 2 : 0) + (unit.inCombat ? 1 : 0),
+         keep: followed,
+       });
+     } else {
+       ctx.font = followed ? 'bold 12px sans-serif' : '11px sans-serif';
+       ctx.fillStyle = '#e2e8f0';
+-      ctx.fillText(unit.name, point.x + radius + 4, point.y + 4);
++      ctx.fillText(unit.name, point.x + radius + 4, top);
+     }
+   }
+   if (plateStyle) drawInstancePlates(ctx, plateStyle, plates, 1);
+@@ -10088,10 +10260,14 @@ function renderWorld3d(): void {
+     // A tile's first visit builds it on the web service (seconds each).
+     const loading = urls.filter((url) => view.state(url) === 'loading').length;
+     const waiting = urls.filter((url) => view.state(url) === undefined).length;
++    const stream = !state.connected ? 'models off (console not connected)'
++      : live ? `models live · ${creatures.length} NPCs (${world3dStreamRadius} yd)`
++        : world3dStream?.status === 'unavailable' ? 'models unavailable (module not updated?)' : 'models starting…';
+     $world3dStatus.textContent = [
+       `${getMapName(player.map)} · tile ${update.centre.x},${update.centre.y}`,
+       `${ready}/${urls.length} tiles${loading ? ` · ${loading} loading` : ''}${waiting ? ` · ${waiting} queued` : ''}`,
+-      `${units.length} in view · ${Math.round(world3dRadius * 2)} yd`,
++      `${units.length} players in view · ${Math.round(world3dRadius * 2)} yd`,
++      stream,
+     ].join(' · ');
+   }
+ }
+@@ -10114,6 +10290,15 @@ $('world3d-rotate-left-btn')?.addEventListener('click', () => rotateWorld3d(-1))
+ $('world3d-rotate-right-btn')?.addEventListener('click', () => rotateWorld3d(1));
+ $('world3d-zoom-in-btn')?.addEventListener('click', () => zoomWorld3d(1));
+ $('world3d-zoom-out-btn')?.addEventListener('click', () => zoomWorld3d(-1));
++const $world3dStreamRadius = $<HTMLSelectElement>('world3d-radius');
++if ($world3dStreamRadius) $world3dStreamRadius.value = String(world3dStreamRadius);
++$world3dStreamRadius?.addEventListener('change', () => {
++  const radius = Number($world3dStreamRadius.value);
++  if (!WORLD3D_STREAM_RADII.includes(radius)) return;
++  world3dStreamRadius = radius;
++  storeSetting(WORLD3D_STREAM_RADIUS_STORAGE_KEY, String(radius));
++  world3dLastDraw = 0;
++});
+ $world3dTrailsBtn?.addEventListener('click', () => {
+   world3dShowTrails = !world3dShowTrails;
+   $world3dTrailsBtn.setAttribute('aria-pressed', String(world3dShowTrails));
+diff --git a/renderer/scripts/types/wowmin-api.ts b/renderer/scripts/types/wowmin-api.ts
+index b85b4b3..8621cfc 100644
+--- a/renderer/scripts/types/wowmin-api.ts
++++ b/renderer/scripts/types/wowmin-api.ts
+@@ -70,9 +70,11 @@ export interface WowminAPI {
+     connect(config: DbConfig): Promise<DbConnectionState>;
+     disconnect(): Promise<void>;
+     getPlayerPositions(mapId?: number, instanceId?: number): Promise<MapPlayerSnapshot>;
+-    // The live position stream (mod-wowmin-telemetry) for one instance;
++    // The live position stream (mod-wowmin-telemetry) for one instance, or
++    // on a continent (instance 0) round one player (`follow`, World 3D);
+     // returns a function that closes it.
+-    streamPositions(mapId: number, instanceId: number, listeners: StreamListeners): () => void;
++    streamPositions(mapId: number, instanceId: number, listeners: StreamListeners,
++      follow?: { name: string; radius: number }): () => void;
+     getOnlineCounts(): Promise<MapOnlineCounts>;
+     getBotWaypoint(request: MapBotWaypointRequest): Promise<MapBotWaypoint | null>;
+     getCreatureInfo(entries: number[]): Promise<CreatureInfo[]>;
+diff --git a/renderer/scripts/web-api.ts b/renderer/scripts/web-api.ts
+index a310a60..4410658 100644
+--- a/renderer/scripts/web-api.ts
++++ b/renderer/scripts/web-api.ts
+@@ -70,8 +70,9 @@ const wowminAPI: WowminAPI = {
+     connect: (config) => invoke('map:connect', config),
+     disconnect: () => invoke('map:disconnect'),
+     getPlayerPositions: (mapId, instanceId) => invoke('map:getPlayerPositions', mapId, instanceId),
+-    streamPositions: (mapId, instanceId, listeners) => {
+-      const source = new EventSource(`/api/stream?map=${mapId}&instance=${instanceId}`);
++    streamPositions: (mapId, instanceId, listeners, follow) => {
++      const followQuery = follow ? `&unit=${encodeURIComponent(follow.name)}&radius=${follow.radius}` : '';
++      const source = new EventSource(`/api/stream?map=${mapId}&instance=${instanceId}${followQuery}`);
+       const data = (event: Event) => JSON.parse((event as MessageEvent<string>).data);
+       source.addEventListener('frame', (event) => listeners.onFrame(data(event)));
+       source.addEventListener('status', (event) => listeners.onStatus(data(event)));
+diff --git a/renderer/styles.css b/renderer/styles.css
+index 017f012..bc66fe8 100644
+--- a/renderer/styles.css
++++ b/renderer/styles.css
+@@ -3603,6 +3603,16 @@ tbody tr:hover { background: var(--tint-accent-05); }
+ .world3d-toolbar .btn { min-width: 32px; }
+ .world3d-toolbar .btn[aria-pressed="false"] { opacity: 0.55; }
+ 
++.world3d-select {
++  height: 26px;
++  padding: 0 6px;
++  border: 1px solid var(--border);
++  border-radius: var(--radius);
++  background: var(--bg-output);
++  color: var(--text);
++  font-size: 11px;
++}
++
+ .world3d-title {
+   font-weight: 600;
+   color: var(--accent-hover);
+diff --git a/scripts/test-telemetry-stream.cjs b/scripts/test-telemetry-stream.cjs
+index 29f532f..420a38b 100644
+--- a/scripts/test-telemetry-stream.cjs
++++ b/scripts/test-telemetry-stream.cjs
+@@ -19,7 +19,7 @@ function loadModule(relativePath) {
+ }
+ 
+ const {
+-  TelemetryStream,
++  TelemetryStream, parseStreamFollow,
+   parseAppearanceDatagram, parseBotDatagram, parseCombatEventDatagram, parseCreatureDatagram, parseDebuffDatagram,
+   parseGameObjectDatagram, parseMarkerDatagram, parsePassengerDatagram, parsePathDatagram, parseStreamDatagram,
+   parseUnitAuraDatagram,
+@@ -766,3 +766,32 @@ test('passes a watched session\'s datagrams to its listeners, naming paths from
+   assert.equal(marked.markers[0].markers.length, 0);
+   assert.equal(seen.markers.length, 0);
+ });
++
++test('a continent stream follows one player within the module radius limits', async () => {
++  assert.deepEqual({ ...parseStreamFollow('Darin', '30') }, { name: 'Darin', radius: 30 });
++  assert.deepEqual({ ...parseStreamFollow('Ériel', '250') }, { name: 'Ériel', radius: 250 });
++  // The name goes into a console command: letters only.
++  for (const name of [null, '', 'A', 'Darin 1', 'Darin;kick', 'Da-rin', 'Averyveryverylongname']) {
++    assert.equal(parseStreamFollow(name, '30'), null, String(name));
++  }
++  for (const radius of [null, '', '9', '251', '30.5', 'x']) assert.equal(parseStreamFollow('Darin', radius), null, String(radius));
++
++  const dgram = require('node:dgram');
++  const probe = dgram.createSocket('udp4');
++  await new Promise((resolve) => probe.bind(0, '127.0.0.1', resolve));
++  const port = probe.address().port;
++  await new Promise((resolve) => probe.close(resolve));
++  const commands = [];
++  const stream = new TelemetryStream(async (command) => { commands.push(command); return { success: true, message: 'WSTREAM|3' }; },
++    '127.0.0.1', port);
++  const listeners = { onStatus: () => {}, onFrame: () => {} };
++  const unwatch = stream.watch(0, 0, listeners, { name: 'Darin', radius: 30 });
++  // Another watcher of the same continent takes the stream over.
++  const unwatchOther = stream.watch(0, 0, listeners, { name: 'Morl', radius: 100 });
++  const unwatchInstance = stream.watch(33, 5, listeners);
++  await new Promise((resolve) => setTimeout(resolve, 20));
++  unwatch();
++  unwatchOther();
++  unwatchInstance();
++  assert.deepEqual(commands, ['wowmin stream 0 0 Darin 30', 'wowmin stream 0 0 Morl 100', 'wowmin stream 33 5']);
++});
+diff --git a/src/telemetry-stream.ts b/src/telemetry-stream.ts
+index e947456..00898cc 100644
+--- a/src/telemetry-stream.ts
++++ b/src/telemetry-stream.ts
+@@ -10,6 +10,9 @@ import type {
+ // while it is watched: every RENEW_INTERVAL_MS the subscription is renewed with
+ // "wowmin stream <mapId> <instanceId>" over SOAP, and the module stops sending
+ // when renewals stop. The datagram layout is documented in WowMinTelemetry.cpp.
++// A continent (instance 0) streams round one followed player instead:
++// "wowmin stream <mapId> 0 <name> <radius>" (World 3D); one per continent, so
++// the latest watcher's player and radius win.
+ 
+ export interface StreamDatagram {
+   mapId: number;
+@@ -435,9 +438,30 @@ export function parseMarkerDatagram(buffer: Buffer): StreamMarkerUpdate | null {
+ 
+ type CommandRunner = (command: string) => Promise<{ success: boolean; message: string }>;
+ 
++// The radius a continent stream may ask for, in yards (the module's limits).
++export const STREAM_FOLLOW_MIN_RADIUS = 10;
++export const STREAM_FOLLOW_MAX_RADIUS = 250;
++
++export interface StreamFollow {
++  name: string;
++  radius: number;
++}
++
++// A continent stream's player and radius from untrusted input (they go into
++// a console command): a character name of letters only, and whole yards
++// within the module's limits; null otherwise.
++export function parseStreamFollow(name: string | null, radius: string | null): StreamFollow | null {
++  if (!name || !/^\p{L}{2,12}$/u.test(name)) return null;
++  const yards = Number(radius);
++  if (!Number.isInteger(yards) || yards < STREAM_FOLLOW_MIN_RADIUS || yards > STREAM_FOLLOW_MAX_RADIUS) return null;
++  return { name, radius: yards };
++}
++
+ interface WatchedSession {
+   mapId: number;
+   instanceId: number;
++  // Continents only: whom the stream follows.
++  follow: StreamFollow | null;
+   listeners: Set<StreamListeners>;
+   status: StreamStatus;
+   // Player names by guid, from the latest frames, for naming paths.
+@@ -520,15 +544,19 @@ export class TelemetryStream {
+   ) {}
+ 
+   // Starts receiving for a session; returns a function that stops watching.
+-  watch(mapId: number, instanceId: number, listeners: StreamListeners): () => void {
++  // A continent (instance 0) needs `follow`.
++  watch(mapId: number, instanceId: number, listeners: StreamListeners, follow: StreamFollow | null = null): () => void {
+     const key = `${mapId}:${instanceId}`;
+     let session = this.sessions.get(key);
+     if (!session) {
+       session = {
+-        mapId, instanceId, listeners: new Set(),
++        mapId, instanceId, follow, listeners: new Set(),
+         status: 'starting', names: new Map(), sequence: 0, parts: new Map(), lastFrameAt: 0, watchedAt: Date.now(),
+       };
+       this.sessions.set(key, session);
++    } else if (follow) {
++      session.follow = follow;
++      session.watchedAt = Date.now();
+     }
+     session.listeners.add(listeners);
+     listeners.onStatus(session.status);
+@@ -577,7 +605,8 @@ export class TelemetryStream {
+ 
+   private async renew(session: WatchedSession): Promise<void> {
+     try {
+-      const result = await this.runCommand(`wowmin stream ${session.mapId} ${session.instanceId}`);
++      const follow = session.instanceId === 0 && session.follow ? ` ${session.follow.name} ${session.follow.radius}` : '';
++      const result = await this.runCommand(`wowmin stream ${session.mapId} ${session.instanceId}${follow}`);
+       const reply = result.success ? result.message.split(/\r?\n/).find((line) => line.startsWith('WSTREAM|')) : null;
+       // An older module has no stream command; treat that as unavailable too.
+       if (!reply || reply === 'WSTREAM|disabled' || reply === 'WSTREAM|full') this.setStatus(session, 'unavailable');
+diff --git a/src/web-server.ts b/src/web-server.ts
+index 10ba828..a95e522 100644
+--- a/src/web-server.ts
++++ b/src/web-server.ts
+@@ -8,6 +8,7 @@ import * as path from 'path';
+ import { inspectLocalLogs, readLocalLogTail } from './local-logs';
+ import { parseUnitModelPath, UnitModels } from './unit-models';
+ import { parseWorldTilePath, WorldTiles } from './world-tiles';
++import { parseStreamFollow } from './telemetry-stream';
+ import { buildContentSecurityPolicy, deriveDungeonClearUrl, normalizeDungeonClearUrl } from './dungeon-clear-config';
+ import type { DbConfig, SoapConfig } from './types/api';
+ 
+@@ -257,8 +258,11 @@ const server = createServer(async (request, response) => {
+   if (url.pathname === '/api/stream') {
+     const mapId = Number(url.searchParams.get('map'));
+     const instanceId = Number(url.searchParams.get('instance'));
+-    if (!Number.isInteger(mapId) || mapId < 0 || !Number.isInteger(instanceId) || instanceId <= 0) {
+-      sendJson(response, 400, { error: 'map and instance are required' });
++    // A continent (instance 0) streams round one player: unit and radius.
++    const follow = instanceId === 0 ? parseStreamFollow(url.searchParams.get('unit'), url.searchParams.get('radius')) : null;
++    if (!Number.isInteger(mapId) || mapId < 0 || !Number.isInteger(instanceId) || instanceId < 0
++      || (instanceId === 0 && !follow)) {
++      sendJson(response, 400, { error: 'map and instance are required (instance 0: unit and radius)' });
+       return;
+     }
+     response.writeHead(200, {
+@@ -281,7 +285,7 @@ const server = createServer(async (request, response) => {
+       onGameObjects: (update) => send('gameobjects', update),
+       onDebuffs: (update) => send('debuffs', update),
+       onMarkers: (update) => send('markers', update),
+-    });
++    }, follow);
+     // Comment lines keep idle connections open through proxies.
+     const keepAlive = setInterval(() => response.write(': keep-alive\n\n'), 15000);
+     request.on('close', () => {

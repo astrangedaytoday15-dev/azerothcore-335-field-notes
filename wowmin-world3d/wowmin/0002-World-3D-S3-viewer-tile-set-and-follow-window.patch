@@ -1,0 +1,574 @@
+From d61188828288645a8da79832c8e44c862faf9418 Mon Sep 17 00:00:00 2001
+From: astrangedaytoday15-dev <342675337+astrangedaytoday15-dev@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 03:03:12 -0400
+Subject: [PATCH 2/4] World 3D S3: viewer tile set and follow window
+
+- InstanceSceneView.render takes one scene URL or several drawn together
+  (World 3D's tiles); unload() frees a scene's geometry, materials and
+  textures, and a load still in flight when unloaded is dropped.
+- renderer/scripts/utils/world-window.ts: the N x N tile window round one
+  followed unit, nearest tile first; follows past a 40-yard hysteresis,
+  keeps the last N tiles left behind, drops everything on a map change;
+  worldTilesToLoad asks for at most two tiles at once.
+- Each building and prop is drawn by one tile only: export-tile.mjs's
+  placementOwner picks, by uniqueId, the tile under its origin when that
+  tile lists it, otherwise the first listing tile round it;
+  exportMapScene takes keepPlacement. Tile schema and cache version 2.
+- Tests for ownership, the window, and load pacing.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ renderer/scripts/instance-scene/scene-view.ts | 109 ++++++++++++----
+ renderer/scripts/utils/world-window.ts        | 120 ++++++++++++++++++
+ scripts/scene/export-scene.mjs                |  11 +-
+ scripts/scene/export-tile.mjs                 |  42 +++++-
+ scripts/test-world-tiles.cjs                  |  81 ++++++++++++
+ src/world-tiles.ts                            |   2 +-
+ 6 files changed, 335 insertions(+), 30 deletions(-)
+ create mode 100644 renderer/scripts/utils/world-window.ts
+
+diff --git a/renderer/scripts/instance-scene/scene-view.ts b/renderer/scripts/instance-scene/scene-view.ts
+index 6a4486d..06f60d6 100644
+--- a/renderer/scripts/instance-scene/scene-view.ts
++++ b/renderer/scripts/instance-scene/scene-view.ts
+@@ -610,7 +610,12 @@ export class InstanceSceneView {
+   private readonly meshBounds = new Map<Object3D, MeshBounds[]>();
+   private readonly states = new Map<string, SceneLoadState>();
+   private readonly materials = new Map<string, Material>();
+-  private shown: Object3D | null = null;
++  // Each loaded scene's textures, freed with it (unload).
++  private readonly textures = new Map<string, Set<Texture>>();
++  // The load in flight for each URL, so one unloaded meanwhile is dropped.
++  private readonly loads = new Map<string, object>();
++  // The scenes drawn: one instance, or a set of World 3D's tiles.
++  private shown: Object3D[] = [];
+   private lost = false;
+   // Player and creature models; lit, unlike the scene.
+   private readonly units: UnitModelLayer;
+@@ -730,14 +735,16 @@ export class InstanceSceneView {
+   // the client does: the floor's baked colour under them), within a budget
+   // a frame and only once they have moved; drops it for the rest.
+   private updateIndoorLights(poses: UnitModelPose[]): void {
+-    const interiors = this.lighting === 'client' && this.shown ? this.interiors.get(this.shown) : undefined;
++    const interiors = this.lighting === 'client'
++      ? this.shown.map((root) => this.interiors.get(root)).filter((byGroup): byGroup is Map<number, Mesh[]> => Boolean(byGroup))
++      : [];
+     const indoors = new Set<string>();
+     let budget = INDOOR_SAMPLES_PER_FRAME;
+     for (const pose of poses) {
+       const groupId = pose.wmoGroupId ?? -1;
+-      const meshes = interiors?.get(groupId);
++      const meshes = interiors.length === 1 ? interiors[0].get(groupId) : interiors.flatMap((byGroup) => byGroup.get(groupId) ?? []);
+       const group = this.mapLights?.interiors?.[groupId];
+-      if (!meshes || group?.outdoor) continue;
++      if (!meshes?.length || group?.outdoor) continue;
+       indoors.add(pose.id);
+       const known = this.indoorLights.get(pose.id);
+       const fresh = known && known.groupId === groupId
+@@ -873,10 +880,23 @@ export class InstanceSceneView {
+   load(url: string): void {
+     if (this.states.has(url)) return;
+     this.states.set(url, 'loading');
++    const token = {};
++    this.loads.set(url, token);
+     this.loader.load(url, async (gltf) => {
+       const root = gltf.scene;
+       const terrain = await this.terrainTextures(gltf);
+       const frames = await this.liquidFrames(gltf);
++      const textures = new Set((await gltf.parser.getDependencies('texture')) as Texture[]);
++      if (terrain) {
++        textures.add(terrain.layers);
++        for (const alpha of terrain.alphas.values()) textures.add(alpha);
++      }
++      if (this.loads.get(url) !== token) {
++        this.dispose(root, textures);
++        return;
++      }
++      this.loads.delete(url);
++      this.textures.set(url, textures);
+       const liquids: Array<{ material: MeshBasicMaterial; frames: Texture[] }> = [];
+       numberBuildingBatches(root);
+       root.traverse((object) => {
+@@ -922,30 +942,76 @@ export class InstanceSceneView {
+       this.states.set(url, 'ready');
+       this.onChange();
+     }, undefined, (error) => {
++      if (this.loads.get(url) !== token) return;
++      this.loads.delete(url);
+       console.warn(`Could not load instance scene ${url}`, error);
+       this.states.set(url, 'failed');
+       this.onChange();
+     });
+   }
+ 
++  // Forgets a scene (loaded, loading, or failed) and frees what it holds on
++  // the GPU; it can be loaded again. World 3D drops the tiles left behind.
++  unload(url: string): void {
++    this.states.delete(url);
++    this.loads.delete(url);
++    const root = this.roots.get(url);
++    if (!root) return;
++    this.roots.delete(url);
++    if (this.shown.includes(root)) {
++      this.scene.remove(root);
++      this.shown = this.shown.filter((shown) => shown !== root);
++      this.visibilityKey = '';
++      this.lastFrameKey = '';
++    }
++    this.meshBounds.delete(root);
++    this.interiors.delete(root);
++    this.liquids.delete(url);
++    this.dispose(root, this.textures.get(url) ?? new Set());
++    this.textures.delete(url);
++  }
++
++  // Frees a scene's geometry, materials (and their cache entries), and
++  // textures. Scenes share none of these: materials are cached by their
++  // source's own uuid.
++  private dispose(root: Object3D, textures: Set<Texture>): void {
++    const materials = new Set<Material>();
++    root.traverse((object) => {
++      if (!(object instanceof Mesh)) return;
++      object.geometry.dispose();
++      if (object instanceof InstancedMesh) object.dispose();
++      for (const material of Array.isArray(object.material) ? object.material : [object.material]) materials.add(material);
++    });
++    for (const material of materials) {
++      const map = (material as MeshBasicMaterial).map;
++      if (map) textures.add(map);
++      material.dispose();
++    }
++    for (const [key, material] of this.materials) if (materials.has(material)) this.materials.delete(key);
++    for (const texture of textures) texture.dispose();
++  }
++
+   // Geometry stays solid around the fade volumes (the party) and fades out
+   // beyond them per `fade`. With no volumes everything is drawn solid.
++  // `url` is one scene, or several drawn together (World 3D's tiles), of
++  // which those loaded are drawn; false when none is.
+   render(
+-    url: string,
++    url: string | readonly string[],
+     view: IsoView,
+     width: number,
+     height: number,
+     volumes: FadeVolume[],
+     fade: FadeSettings,
+   ): boolean {
+-    const root = this.roots.get(url);
+-    if (!root || this.lost) return false;
++    const urls = (typeof url === 'string' ? [url] : url).filter((candidate) => this.roots.has(candidate));
++    const roots = urls.map((candidate) => this.roots.get(candidate)!);
++    if (!roots.length || this.lost) return false;
+     const active = volumes.slice(0, MAX_FADE_VOLUMES);
+     const pixelRatio = Math.min(window.devicePixelRatio || 1, MAX_PIXEL_RATIO) * this.renderScale;
+     // Live positions redraw the overlay up to 30 times a second; the scene only
+     // changes when the camera moves or the fade shifts by about a yard.
+     const visibilityKey = [
+-      url, fade.height, fade.horizontal ?? 0,
++      urls.join(','), fade.height, fade.horizontal ?? 0,
+       ...(fade.reach ? [fade.reach.minX, fade.reach.maxX, fade.reach.minY, fade.reach.maxY, fade.reach.minZ, fade.reach.maxZ] : ['none']),
+       ...active.flatMap((volume) => [volume.minX, volume.maxX, volume.minY, volume.maxY, volume.minZ, volume.maxZ]
+         .map((value) => Math.round(value))),
+@@ -958,20 +1024,18 @@ export class InstanceSceneView {
+       lightKey,
+     ].join('|');
+     // Animated models, live effects, and liquids need every frame.
+-    const liquids = this.liquids.get(url);
+-    if (frameKey === this.lastFrameKey && !this.units.count && !this.effectsShown && !liquids?.length
++    const liquids = urls.flatMap((candidate) => this.liquids.get(candidate) ?? []);
++    if (frameKey === this.lastFrameKey && !this.units.count && !this.effectsShown && !liquids.length
+       && !this.gameObjects.count) return true;
+-    if (liquids) {
+-      for (const liquid of liquids) {
+-        liquid.material.map = liquid.frames[Math.floor(performance.now() / (1000 / LIQUID_FPS)) % liquid.frames.length];
+-      }
++    for (const liquid of liquids) {
++      liquid.material.map = liquid.frames[Math.floor(performance.now() / (1000 / LIQUID_FPS)) % liquid.frames.length];
+     }
+     this.lastFrameKey = frameKey;
+     this.lastFade = { volumes: active, fade };
+-    if (this.shown !== root) {
+-      if (this.shown) this.scene.remove(this.shown);
+-      this.scene.add(root);
+-      this.shown = root;
++    if (this.shown.length !== roots.length || this.shown.some((shown, index) => shown !== roots[index])) {
++      for (const shown of this.shown) if (!roots.includes(shown)) this.scene.remove(shown);
++      for (const root of roots) if (!this.shown.includes(root)) this.scene.add(root);
++      this.shown = roots;
+     }
+     const data = this.fadeData;
+     active.forEach((volume, index) => {
+@@ -986,7 +1050,7 @@ export class InstanceSceneView {
+     data.set([fade.height, fade.horizontal ?? 0, active.length], FADE_PARAMS_OFFSET);
+     if (visibilityKey !== this.visibilityKey) {
+       this.visibilityKey = visibilityKey;
+-      this.chooseVisible(root, active, fade, reachBox);
++      for (const root of roots) this.chooseVisible(root, active, fade, reachBox);
+     }
+     // Resizing clears and reallocates the drawing buffer, so only on a change.
+     const sizeKey = `${width}x${height}@${pixelRatio}`;
+@@ -1003,7 +1067,7 @@ export class InstanceSceneView {
+     this.fadeData.set([clientLight.sun.x, clientLight.sun.y, clientLight.sun.z], CLIENT_SUN_OFFSET);
+     this.fadeData.set([clientLight.indoor.x, clientLight.indoor.y, clientLight.indoor.z], CLIENT_INDOOR_OFFSET);
+     // setUnits has already updated the unit models' matrices this frame.
+-    for (const child of this.scene.children) if (child !== root && child !== this.units.group) child.updateMatrixWorld();
++    for (const child of this.scene.children) if (!roots.includes(child) && child !== this.units.group) child.updateMatrixWorld();
+     this.renderer.render(this.scene, this.camera);
+     // Exposed for diagnosing slow scenes from the browser's developer tools.
+     this.canvas.dataset.drawCalls = String(this.renderer.info.render.calls);
+@@ -1073,13 +1137,12 @@ export class InstanceSceneView {
+   // `view`: the nearest surface that is drawn there, skipping geometry the
+   // fade or the reach cut leaves out. Null over empty space.
+   pick(view: IsoView, width: number, height: number, x: number, y: number): Point3 | null {
+-    const root = this.shown;
+     const fade = this.lastFade;
+-    if (!root || !fade) return null;
++    if (!this.shown.length || !fade) return null;
+     applyIsoCamera(this.camera, view, width, height);
+     this.camera.updateMatrixWorld();
+     this.raycaster.setFromCamera(new Vector2((x / width) * 2 - 1, 1 - (y / height) * 2), this.camera);
+-    for (const hit of this.raycaster.intersectObject(root, true)) {
++    for (const hit of this.raycaster.intersectObjects(this.shown, true)) {
+       let shown = true;
+       for (let object: Object3D | null = hit.object; object; object = object.parent) shown &&= object.visible;
+       if (!shown) continue;
+diff --git a/renderer/scripts/utils/world-window.ts b/renderer/scripts/utils/world-window.ts
+new file mode 100644
+index 0000000..16353c2
+--- /dev/null
++++ b/renderer/scripts/utils/world-window.ts
+@@ -0,0 +1,120 @@
++// World 3D's follow window: the size x size open-world tiles round one
++// followed unit, as tile scene paths (served by the web service, built on
++// first ask: src/world-tiles.ts), and which loaded tiles to let go as the
++// unit moves on. Tiles are named by their ADT file numbers, as the exporter
++// names them (scripts/scene/export-tile.mjs): x runs with server Y and y with
++// server X, both counting down from 32 at the map centre.
++
++export const WORLD_TILE_SIZE = 1600 / 3;
++const TILES_PER_SIDE = 64;
++// The unit moves this far past its tile's edge before the window follows,
++// so walking along an edge does not swap rows back and forth.
++export const WORLD_WINDOW_HYSTERESIS = 40;
++
++export interface WorldTile {
++  x: number;
++  y: number;
++}
++
++export interface WorldWindowUpdate {
++  mapId: number;
++  centre: WorldTile;
++  // The window's tile paths, nearest the centre first (the order to ask for
++  // them, as tiles are built one at a time).
++  paths: string[];
++  // Paths no longer kept, to unload.
++  drop: string[];
++}
++
++export function worldTileAt(serverX: number, serverY: number): WorldTile {
++  return { x: Math.floor(32 - serverY / WORLD_TILE_SIZE), y: Math.floor(32 - serverX / WORLD_TILE_SIZE) };
++}
++
++// The server box a tile covers.
++export function worldTileBounds({ x, y }: WorldTile): { minX: number; maxX: number; minY: number; maxY: number } {
++  const maxX = (32 - y) * WORLD_TILE_SIZE;
++  const maxY = (32 - x) * WORLD_TILE_SIZE;
++  return { minX: maxX - WORLD_TILE_SIZE, maxX, minY: maxY - WORLD_TILE_SIZE, maxY };
++}
++
++// The size x size tiles round `centre` that are on the map's grid, nearest
++// first (then row by row); size is odd.
++export function worldTileWindow(centre: WorldTile, size: number): WorldTile[] {
++  const reach = Math.floor(size / 2);
++  const tiles: WorldTile[] = [];
++  for (let dy = -reach; dy <= reach; dy += 1) {
++    for (let dx = -reach; dx <= reach; dx += 1) {
++      const tile = { x: centre.x + dx, y: centre.y + dy };
++      if (tile.x >= 0 && tile.y >= 0 && tile.x < TILES_PER_SIDE && tile.y < TILES_PER_SIDE) tiles.push(tile);
++    }
++  }
++  const distance = (tile: WorldTile) => Math.max(Math.abs(tile.x - centre.x), Math.abs(tile.y - centre.y));
++  return tiles.sort((a, b) => distance(a) - distance(b));
++}
++
++// Tiles asked for at once: the web service holds each request open while it
++// builds the tile (one at a time, seconds each), and the browser has only a
++// few connections to it for everything else.
++export const WORLD_TILE_LOADS = 2;
++
++// The window's tiles to start loading now, nearest first, so that at most
++// `limit` are loading at once; `state` is the viewer's (undefined before a
++// load starts).
++export function worldTilesToLoad(paths: readonly string[], state: (path: string) => string | undefined, limit = WORLD_TILE_LOADS): string[] {
++  const loading = paths.filter((path) => state(path) === 'loading').length;
++  return paths.filter((path) => state(path) === undefined).slice(0, Math.max(0, limit - loading));
++}
++
++export function worldTilePath(mapId: number, { x, y }: WorldTile): string {
++  return `assets/world/${mapId}/${x}_${y}.glb`;
++}
++
++// Follows one unit: the window's centre moves when the unit leaves the
++// centre tile (by more than the hysteresis) or changes map. Tiles that drop
++// out of the window stay loaded, the most recent `keep` of them, for when
++// the unit turns back.
++export class WorldFollowWindow {
++  private mapId: number | null = null;
++  private centre: WorldTile | null = null;
++  private paths: string[] = [];
++  // Left behind, oldest first.
++  private kept: string[] = [];
++
++  constructor(readonly size: number, private readonly keep = size) {}
++
++  update(mapId: number, serverX: number, serverY: number): WorldWindowUpdate {
++    const drop: string[] = [];
++    if (mapId !== this.mapId) {
++      drop.push(...this.paths, ...this.kept);
++      this.paths = [];
++      this.kept = [];
++      this.centre = null;
++      this.mapId = mapId;
++    }
++    if (!this.centre || !this.holds(this.centre, serverX, serverY)) {
++      this.centre = worldTileAt(serverX, serverY);
++      const paths = worldTileWindow(this.centre, this.size).map((tile) => worldTilePath(mapId, tile));
++      const left = this.paths.filter((path) => !paths.includes(path));
++      this.kept = [...this.kept.filter((path) => !paths.includes(path) && !left.includes(path)), ...left];
++      drop.push(...this.kept.splice(0, Math.max(0, this.kept.length - this.keep)));
++      this.paths = paths;
++    }
++    return { mapId, centre: this.centre, paths: this.paths, drop };
++  }
++
++  // Lets every tile go (the view closed).
++  clear(): string[] {
++    const drop = [...this.paths, ...this.kept];
++    this.mapId = null;
++    this.centre = null;
++    this.paths = [];
++    this.kept = [];
++    return drop;
++  }
++
++  private holds(tile: WorldTile, serverX: number, serverY: number): boolean {
++    const box = worldTileBounds(tile);
++    const pad = WORLD_WINDOW_HYSTERESIS;
++    return serverX >= box.minX - pad && serverX < box.maxX + pad && serverY >= box.minY - pad && serverY < box.maxY + pad;
++  }
++}
+diff --git a/scripts/scene/export-scene.mjs b/scripts/scene/export-scene.mjs
+index 688a313..36182a9 100644
+--- a/scripts/scene/export-scene.mjs
++++ b/scripts/scene/export-scene.mjs
+@@ -433,7 +433,7 @@ class SceneBuilder {
+ }
+ 
+ export async function exportMapScene({
+-  mapId, internalName, readFile, outputDir, textureMax = 512, floors = [], worldMapBounds = null,
++  mapId, internalName, readFile, outputDir, textureMax = 512, floors = [], worldMapBounds = null, keepPlacement = null,
+ }) {
+   const mapPath = `World\\maps\\${internalName}\\${internalName}`;
+   const wdtBuffer = readFile(`${mapPath}.wdt`);
+@@ -448,6 +448,13 @@ export async function exportMapScene({
+     doodadPlacements = dedupeByUniqueId(tiles.flatMap((tile) => tile.doodads));
+   }
+   if (!wmoPlacements.length && !doodadPlacements.length) throw new Error(`${internalName} places no buildings or doodads.`);
++  // keepPlacement(placement, 'wmo' | 'doodad') leaves out placements another
++  // scene draws (World 3D's tiles, export-tile.mjs); the loose props it keeps
++  // are not cropped to the area as well.
++  if (keepPlacement) {
++    wmoPlacements = wmoPlacements.filter((placement) => keepPlacement(placement, 'wmo'));
++    doodadPlacements = doodadPlacements.filter((placement) => keepPlacement(placement, 'doodad'));
++  }
+ 
+   const builder = new SceneBuilder({ mapId, readFile, textureMax });
+   const { document } = builder;
+@@ -520,7 +527,7 @@ export async function exportMapScene({
+   // the buildings' area (see playArea). Loose props and the ground are
+   // cropped to it; with nothing to go by, props are all kept.
+   const area = wdt.wmoOnly ? [] : playArea(floors, worldMapBounds, undefined, groups);
+-  const looseDoodads = area.length
++  const looseDoodads = area.length && !keepPlacement
+     ? doodadPlacements.filter((placement) => pointInArea(placement.position, area))
+     : doodadPlacements;
+   for (const placement of looseDoodads) {
+diff --git a/scripts/scene/export-tile.mjs b/scripts/scene/export-tile.mjs
+index 2a051d4..890bbf0 100644
+--- a/scripts/scene/export-tile.mjs
++++ b/scripts/scene/export-tile.mjs
+@@ -4,16 +4,18 @@
+ // of the map reads as missing, and the play area is the tile's own box.
+ // Tiles are named by their ADT file numbers (<map>_<x>_<y>.adt): x runs with
+ // server Y and y with server X, both counting down from 32 at the map centre.
+-// A WMO is kept whole by the tile that places it, so a building over a tile
+-// edge reaches past its box (and neighbours can place the same one).
++// Every ADT a building or prop overlaps lists it, so each placement is drawn
++// by one tile only (placementOwner): a building over a tile edge is kept
++// whole and reaches past its owner's box.
+ 
+ import fs from 'node:fs';
+ import path from 'node:path';
+ 
+-import { readWdt } from './placement.mjs';
++import { readAdtPlacements, readWdt } from './placement.mjs';
+ import { exportMapScene } from './export-scene.mjs';
+ 
+-export const WORLD_TILE_SCHEMA_VERSION = 1;
++// 2: each building and prop in one tile only (placementOwner).
++export const WORLD_TILE_SCHEMA_VERSION = 2;
+ export const TILE_SIZE = 1600 / 3;
+ export const TILES_PER_SIDE = 64;
+ 
+@@ -61,6 +63,32 @@ export function onlyTile(readFile, internalName, x, y) {
+   };
+ }
+ 
++// The tile that draws a placement listed in tile (x, y)'s ADT: the tile under
++// its origin when that tile's ADT lists it too; otherwise (an origin off the
++// building, or on a tile that does not list it) the first tile, row by row,
++// of (x, y) and its neighbours that lists it. `listed(tileX, tileY)` is the
++// set of uniqueIds a tile's ADT lists, or null without one. Tiles that list
++// the same placement agree as long as they are all neighbours.
++export function placementOwner(placement, x, y, listed) {
++  const origin = tileAt(placement.position[0], placement.position[1]);
++  if (isTileInRange(origin.x, origin.y) && listed(origin.x, origin.y)?.has(placement.uniqueId)) return origin;
++  return tileWindow(x, y, 3).find((tile) => listed(tile.x, tile.y)?.has(placement.uniqueId)) ?? { x, y };
++}
++
++// listed() for placementOwner from the map's ADTs, each read once.
++function listedPlacements(readFile, internalName) {
++  const cache = new Map();
++  return (x, y) => {
++    const key = tileBaseName(x, y);
++    if (!cache.has(key)) {
++      const buffer = readFile(`World\\maps\\${internalName}\\${internalName}_${x}_${y}.adt`);
++      const placements = buffer ? readAdtPlacements(buffer) : null;
++      cache.set(key, placements && new Set([...placements.wmos, ...placements.doodads].map((placement) => placement.uniqueId)));
++    }
++    return cache.get(key);
++  };
++}
++
+ // Writes the tile's scene into outputDir, or an <x>_<y>.empty marker for a
+ // tile the map has no ADT for (open sea), so it is not asked for again.
+ // Returns { empty, manifest, stats }.
+@@ -84,8 +112,14 @@ export async function exportWorldTile({ mapId, internalName, readFile, outputDir
+   fs.mkdirSync(workDir, { recursive: true });
+   try {
+     const bounds = tileBounds(x, y);
++    const listed = listedPlacements(readFile, internalName);
++    const keepPlacement = (placement) => {
++      const owner = placementOwner(placement, x, y, listed);
++      return owner.x === x && owner.y === y;
++    };
+     const { scene, stats } = await exportMapScene({
+       mapId, internalName, readFile: onlyTile(readFile, internalName, x, y), outputDir: workDir, textureMax, worldMapBounds: bounds,
++      keepPlacement,
+     });
+     const manifest = {
+       schemaVersion: WORLD_TILE_SCHEMA_VERSION, mapId, tile: [x, y], tileBounds: bounds, ...scene, file: `${base}.glb`,
+diff --git a/scripts/test-world-tiles.cjs b/scripts/test-world-tiles.cjs
+index 291df59..6c2259e 100644
+--- a/scripts/test-world-tiles.cjs
++++ b/scripts/test-world-tiles.cjs
+@@ -93,3 +93,84 @@ test('the web service maps tile URLs to tiles and reads the window size', () =>
+   assert.equal(worldWindowSize('9'), 3);
+   assert.equal(worldWindowSize('x'), 3);
+ });
++
++test('each building or prop is drawn by one tile: the one under its origin, if that lists it', async () => {
++  const { placementOwner, tileBounds } = await tiles;
++  // Tiles 32,32 and 33,32 both list placement 7; tile 31,31 lists 9.
++  const lists = new Map([['32_32', new Set([7, 8])], ['33_32', new Set([7])], ['31_31', new Set([9])]]);
++  const listed = (x, y) => lists.get(`${x}_${y}`) ?? null;
++  const inside = (x, y) => { const box = tileBounds(x, y); return [(box.minX + box.maxX) / 2, (box.minY + box.maxY) / 2, 0]; };
++  // Origin on 33,32, which lists it: both tiles agree on 33,32.
++  const edge = { uniqueId: 7, position: inside(33, 32) };
++  assert.deepEqual(placementOwner(edge, 32, 32, listed), { x: 33, y: 32 });
++  assert.deepEqual(placementOwner(edge, 33, 32, listed), { x: 33, y: 32 });
++  // Origin on a tile that does not list it: the first listing tile, row by row.
++  const off = { uniqueId: 7, position: inside(40, 40) };
++  assert.deepEqual(placementOwner(off, 32, 32, listed), { x: 32, y: 32 });
++  assert.deepEqual(placementOwner(off, 33, 32, listed), { x: 32, y: 32 });
++  // Only one tile lists it: that one.
++  assert.deepEqual(placementOwner({ uniqueId: 8, position: inside(33, 32) }, 32, 32, listed), { x: 32, y: 32 });
++});
++
++const {
++  WorldFollowWindow, worldTileAt, worldTileBounds, worldTilePath, worldTilesToLoad, worldTileWindow, WORLD_WINDOW_HYSTERESIS,
++} = loadModule('../renderer/scripts/utils/world-window.ts');
++
++test('the viewer finds the same tiles as the exporter, nearest the centre first', async () => {
++  const { tileAt, tileBounds, tileWindow } = await tiles;
++  for (const [x, y] of [[-467, -163.5], [-263.8, -656.3], [1676, -4315], [-8913, 554]]) {
++    assert.deepEqual({ ...worldTileAt(x, y) }, tileAt(x, y));
++    const tile = tileAt(x, y);
++    assert.deepEqual({ ...worldTileBounds(tile) }, tileBounds(tile.x, tile.y));
++  }
++  const window = worldTileWindow({ x: 32, y: 32 }, 3).map((tile) => ({ ...tile }));
++  assert.deepEqual(window[0], { x: 32, y: 32 });
++  assert.deepEqual([...window].sort((a, b) => a.y - b.y || a.x - b.x), tileWindow(32, 32, 3));
++  assert.equal(worldTileWindow({ x: 0, y: 0 }, 3).length, 4);
++  assert.equal(worldTilePath(0, { x: 32, y: 31 }), 'assets/world/0/32_31.glb');
++});
++
++test('the follow window moves a row at a time and keeps a few tiles behind', () => {
++  const follow = new WorldFollowWindow(3);
++  const centre = (tile) => { const box = worldTileBounds(tile); return [(box.minX + box.maxX) / 2, (box.minY + box.maxY) / 2]; };
++  let update = follow.update(0, ...centre({ x: 32, y: 32 }));
++  assert.equal(update.paths.length, 9);
++  assert.equal(update.paths[0], 'assets/world/0/32_32.glb');
++  assert.equal(update.drop.length, 0);
++  // Just past the edge into 33,32 (server Y falls going east): no move yet.
++  const box = worldTileBounds({ x: 32, y: 32 });
++  update = follow.update(0, centre({ x: 32, y: 32 })[0], box.minY - WORLD_WINDOW_HYSTERESIS / 2);
++  assert.equal(update.centre.x, 32);
++  // Well into 33,32: one column in, one left behind but kept.
++  update = follow.update(0, ...centre({ x: 33, y: 32 }));
++  assert.deepEqual({ ...update.centre }, { x: 33, y: 32 });
++  assert.ok(update.paths.includes('assets/world/0/34_32.glb'));
++  assert.ok(!update.paths.includes('assets/world/0/31_32.glb'));
++  assert.equal(update.drop.length, 0);
++  // Another column: the kept ones beyond three are dropped, oldest first.
++  update = follow.update(0, ...centre({ x: 34, y: 32 }));
++  assert.equal(update.drop.length, 3);
++  assert.ok(update.drop.every((path) => path.startsWith('assets/world/0/31_')));
++  // Back one column: the kept tiles come back without a reload.
++  update = follow.update(0, ...centre({ x: 33, y: 32 }));
++  assert.equal(update.drop.length, 0);
++  assert.ok(update.paths.includes('assets/world/0/32_32.glb'));
++  // A new map lets every tile go.
++  update = follow.update(1, ...centre({ x: 30, y: 30 }));
++  assert.equal(update.drop.length, 12);
++  assert.ok(update.paths.every((path) => path.startsWith('assets/world/1/')));
++  assert.equal(follow.clear().length, 9);
++});
++
++test('tiles load a couple at a time, nearest first', () => {
++  const paths = ['a', 'b', 'c', 'd'];
++  const states = new Map();
++  const state = (path) => states.get(path);
++  assert.deepEqual([...worldTilesToLoad(paths, state)], ['a', 'b']);
++  states.set('a', 'loading').set('b', 'loading');
++  assert.equal(worldTilesToLoad(paths, state).length, 0);
++  states.set('a', 'ready');
++  assert.deepEqual([...worldTilesToLoad(paths, state)], ['c']);
++  states.set('b', 'failed').set('c', 'ready');
++  assert.deepEqual([...worldTilesToLoad(paths, state)], ['d']);
++});
+diff --git a/src/world-tiles.ts b/src/world-tiles.ts
+index 0a90ac5..78d6f84 100644
+--- a/src/world-tiles.ts
++++ b/src/world-tiles.ts
+@@ -11,7 +11,7 @@ import * as path from 'path';
+ // A tile takes about 10 s (Hillsbrad, measured); several may queue ahead.
+ const BUILD_TIMEOUT_MS = 5 * 60 * 1000;
+ // Bumped when the tile exporter's output changes, so tiles are rebuilt.
+-export const WORLD_TILE_CACHE_VERSION = 1;
++export const WORLD_TILE_CACHE_VERSION = 2;
+ // A tile that could not be built is not retried for this long.
+ const FAILURE_RETRY_MS = 10 * 60 * 1000;
+ // Window sizes the viewer may ask for (odd, centred on the followed unit).

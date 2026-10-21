@@ -15,6 +15,7 @@ run the project with Claude Code.
 | [03_Gotchas.md](03_Gotchas.md) | Symptom / cause / fix catalog: traps that cost us time |
 | [04_Workflow_With_Claude.md](04_Workflow_With_Claude.md) | How the project runs with an AI coding assistant: docs as memory, safe DB writes, tests |
 | [playerbots-guild-bank-exchange/](playerbots-guild-bank-exchange/README.md) | Extra: a standalone mod-playerbots patch that lets guild bots use the guild bank (GPL-2.0) |
+| [wowmin-world3d/](wowmin-world3d/README.md) | Extra: patches for WoWMin and mod-wowmin-telemetry that show the open world in 3D round one bot, with live models and NPCs (MIT) |
 
 ## How much to trust a line
 
@@ -66,6 +67,9 @@ you build on it.
 
 **The playerbots patch** in `playerbots-guild-bank-exchange/` modifies
 mod-playerbots, so it is GPL-2.0-or-later (its own `COPYING`).
+
+**The WoWMin patches** in `wowmin-world3d/` modify WoWMin and
+mod-wowmin-telemetry (both MIT, by their authors); the patches are MIT too.
 
 **Third-party projects:** AzerothCore (GPL-2.0-or-later, per its file
 headers), mod-playerbots (GPL-2.0) and mod-ale (GPL-3.0) belong to their

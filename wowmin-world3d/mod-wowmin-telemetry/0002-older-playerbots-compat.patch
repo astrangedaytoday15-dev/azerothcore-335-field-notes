@@ -1,0 +1,58 @@
+diff --git a/src/WowMinTelemetry.cpp b/src/WowMinTelemetry.cpp
+index 524f763..44ec336 100644
+--- a/src/WowMinTelemetry.cpp
++++ b/src/WowMinTelemetry.cpp
+@@ -1883,13 +1883,13 @@ public:
+                                    GetSessionStartedAt(player->GetMapId(), player->GetInstanceId()),
+                                    group ? group->GetGUID().GetCounter() : 0,
+                                    group && group->isRaidGroup(),
+-                                   group ? group->GetMemberGroup(player->GetGUID()) : 0,
++                                   static_cast<uint32>(group ? group->GetMemberGroup(player->GetGUID()) : 0),
+                                    player->GetTeamId(),
+                                    player->GetHealthPct(),
+                                    powerType,
+                                    player->GetPowerPct(powerType),
+                                    target ? target->GetGUID().GetCounter() : 0,
+-                                   target ? target->GetTypeId() : TYPEID_OBJECT,
++                                   static_cast<uint32>(target ? target->GetTypeId() : TYPEID_OBJECT),
+                                    target ? target->GetName() : "",
+                                    GetGroupRole(group, player->GetGUID()),
+                                    player->HasAura(SPELL_WAITING_FOR_RESURRECT),
+@@ -2513,6 +2513,18 @@ private:
+     }
+ 
+ #ifdef MOD_PLAYERBOTS
++    // Classic Plus local patch (S97): our mod-playerbots rev has no
++    // PlayerbotAI::GetCurrentEngine(), so read the protected member it returns.
++    struct PlayerbotAICurrentEngine : PlayerbotAI
++    {
++        using PlayerbotAI::currentEngine;
++    };
++
++    static Engine* GetBotCurrentEngine(PlayerbotAI* botAI)
++    {
++        return botAI->*(&PlayerbotAICurrentEngine::currentEngine);
++    }
++
+     // Adds what the bot is deciding to `bots` when that has changed, or is due
+     // a refresh.
+     static void CollectBot(Map* map, Player* player, StreamSessionState& state, uint64 nowMs,
+@@ -2523,7 +2535,7 @@ private:
+         if (!context)
+             return;
+         uint32 const guid = GetStreamUnitId(player->GetGUID());
+-        std::shared_ptr<BotActionLog> const log = TrackBotActions(guid, botAI->GetCurrentEngine());
++        std::shared_ptr<BotActionLog> const log = TrackBotActions(guid, GetBotCurrentEngine(botAI));
+         auto [iterator, inserted] = state.bots.try_emplace(guid);
+         StreamSessionState::SentSignature& sent = iterator->second;
+         if (!inserted && nowMs - sent.sentAtMs < STREAM_BOT_MIN_INTERVAL_MS)
+@@ -3267,7 +3279,8 @@ public:
+         deaths.push_back({map->GetId(), map->GetInstanceId(), nextDeathEventId++,
+                           static_cast<uint64>(GameTime::GetGameTime().count()), victim->GetGUID().GetCounter(),
+                           victim->GetName(), killer ? killer->GetGUID().GetCounter() : 0,
+-                          killer ? killer->GetTypeId() : TYPEID_OBJECT, killer ? killer->GetName() : ""});
++                          static_cast<uint32>(killer ? killer->GetTypeId() : TYPEID_OBJECT),
++                          killer ? killer->GetName() : ""});
+         if (deaths.size() > MAX_DEATH_HISTORY)
+             deaths.pop_front();
+     }

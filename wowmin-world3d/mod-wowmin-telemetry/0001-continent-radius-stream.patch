@@ -1,0 +1,244 @@
+diff --git a/src/WowMinTelemetry.cpp b/src/WowMinTelemetry.cpp
+index 44ec336..5dce8ff 100644
+--- a/src/WowMinTelemetry.cpp
++++ b/src/WowMinTelemetry.cpp
+@@ -261,6 +261,11 @@ uint32 GetStreamUnitId(ObjectGuid guid)
+ // renews it every few seconds. While subscribed, the map queues snapshots at
+ // WowMinTelemetry.Stream.IntervalMs. The world thread sends them after maps
+ // join, only to the configured destination (never one chosen by a command).
++// On a continent (instance 0) the stream follows one player instead:
++// "wowmin stream <mapId> 0 <playerName> <radiusYards>" sends only what is
++// within that many yards of them (STREAM_MIN_RADIUS to STREAM_MAX_RADIUS),
++// in the same datagrams with instance 0. One such stream per continent; a
++// new player replaces the old.
+ //
+ // Datagram, little-endian. In version 3, every unit GUID field below uses
+ // GetStreamUnitId: players keep their low GUID; non-players carry the low
+@@ -403,6 +408,9 @@ uint32 GetStreamUnitId(ObjectGuid guid)
+ constexpr uint8 STREAM_VERSION = 3;
+ constexpr uint64 STREAM_SUBSCRIPTION_TTL_MS = 10000;
+ constexpr std::size_t STREAM_MAX_SUBSCRIPTIONS = 64;
++// A continent stream's radius, in yards (players see 100 by default).
++constexpr uint32 STREAM_MIN_RADIUS = 10;
++constexpr uint32 STREAM_MAX_RADIUS = 250;
+ constexpr std::size_t STREAM_MAX_DATAGRAM = 1200;
+ constexpr std::size_t STREAM_MAX_QUEUED_DATAGRAMS = 2048;
+ constexpr std::size_t STREAM_MAX_NAME = 48;
+@@ -616,12 +624,31 @@ struct StreamSessionState
+     uint32 droppedEvents = 0;
+ };
+ 
++// What a continent stream sends: units within `radius` yards (on the flat)
++// of the followed player. Radius 0: the whole map (instances).
++struct StreamArea
++{
++    float x = 0.0f;
++    float y = 0.0f;
++    float radius = 0.0f;
++
++    bool Contains(WorldObject const* object) const
++    {
++        return radius <= 0.0f || object->GetExactDist2dSq(x, y) <= radius * radius;
++    }
++};
++
+ struct StreamSubscription
+ {
+     uint64 expiresAtMs;
+     uint32 elapsedMs;
+     uint32 sequence;
+     std::shared_ptr<StreamSessionState> state;
++    // Continents only: the player followed, the radius asked for, and the
++    // area of the last snapshot (radius 0 until the player is found).
++    ObjectGuid centre;
++    uint32 radius = 0;
++    StreamArea area;
+ };
+ 
+ std::mutex streamStateMutex;
+@@ -1772,7 +1799,26 @@ public:
+         arguments >> mapArgument >> instanceArgument;
+         auto const mapId = Acore::StringTo<uint32>(mapArgument);
+         auto const instanceId = Acore::StringTo<uint32>(instanceArgument);
+-        if (!mapId || !instanceId || !*instanceId || arguments >> unexpectedArgument)
++        // A continent: follow one player within a radius.
++        ObjectGuid centre;
++        uint32 radius = 0;
++        if (mapId && instanceId && !*instanceId)
++        {
++            std::string nameArgument;
++            std::string radiusArgument;
++            arguments >> nameArgument >> radiusArgument;
++            MapEntry const* mapEntry = sMapStore.LookupEntry(*mapId);
++            Player* player = nameArgument.empty() ? nullptr : ObjectAccessor::FindPlayerByName(nameArgument);
++            auto const radiusYards = Acore::StringTo<uint32>(radiusArgument);
++            if (!mapEntry || mapEntry->Instanceable() || !player || !radiusYards)
++            {
++                handler->SendSysMessage("Usage: wowmin stream <mapId> 0 <playerName> <radiusYards> (a continent, a player online)");
++                return false;
++            }
++            centre = player->GetGUID();
++            radius = std::clamp(*radiusYards, STREAM_MIN_RADIUS, STREAM_MAX_RADIUS);
++        }
++        if (!mapId || !instanceId || arguments >> unexpectedArgument)
+         {
+             handler->SendSysMessage("Usage: wowmin stream <mapId> <instanceId>");
+             return false;
+@@ -1787,11 +1833,24 @@ public:
+             uint64 const sessionKey = GetSessionKey(*mapId, *instanceId);
+             auto const iterator = streamSubscriptions.find(sessionKey);
+             if (iterator != streamSubscriptions.end())
++            {
+                 iterator->second.expiresAtMs = expiresAtMs;
++                // Following someone else: start over, so all near them is sent as new.
++                if (iterator->second.centre != centre)
++                {
++                    expiredStates.push_back(iterator->second.state);
++                    iterator->second.state = std::make_shared<StreamSessionState>();
++                    iterator->second.centre = centre;
++                    iterator->second.area = {};
++                }
++                iterator->second.radius = radius;
++            }
+             else if (streamSubscriptions.size() < STREAM_MAX_SUBSCRIPTIONS)
+             {
+-                streamSubscriptions.emplace(
+-                    sessionKey, StreamSubscription{expiresAtMs, 0, 0, std::make_shared<StreamSessionState>()});
++                StreamSubscription subscription{expiresAtMs, 0, 0, std::make_shared<StreamSessionState>()};
++                subscription.centre = centre;
++                subscription.radius = radius;
++                streamSubscriptions.emplace(sessionKey, std::move(subscription));
+                 streamAnySubscribed = true;
+             }
+             else
+@@ -2034,8 +2093,15 @@ public:
+ 
+     void OnMapUpdate(Map* map, uint32 diff) override
+     {
+-        if (!telemetryConfig.GetConfigValue<bool>(WowMinTelemetryConfig::Enabled) || !map->GetInstanceId())
++        if (!telemetryConfig.GetConfigValue<bool>(WowMinTelemetryConfig::Enabled))
++            return;
++        // Continents only stream, and only round a followed player.
++        if (!map->GetInstanceId())
++        {
++            if (streamAnySubscribed && telemetryConfig.GetConfigValue<bool>(WowMinTelemetryConfig::StreamEnabled))
++                StreamPositions(map, GetSessionKey(map->GetId(), 0), diff);
+             return;
++        }
+ 
+         uint64 const sessionKey = GetSessionKey(map->GetId(), map->GetInstanceId());
+         if (telemetryConfig.GetConfigValue<bool>(WowMinTelemetryConfig::StreamEnabled))
+@@ -2064,6 +2130,8 @@ private:
+         uint64 const nowMs = GameTime::GetGameTimeMS().count();
+         uint32 sequence = 0;
+         std::shared_ptr<StreamSessionState> state;
++        ObjectGuid centre;
++        uint32 radius = 0;
+         {
+             std::lock_guard<std::mutex> lock(streamStateMutex);
+             auto const iterator = streamSubscriptions.find(sessionKey);
+@@ -2082,8 +2150,26 @@ private:
+             iterator->second.elapsedMs = 0;
+             sequence = ++iterator->second.sequence;
+             state = iterator->second.state;
++            centre = iterator->second.centre;
++            radius = iterator->second.radius;
+         }
+ 
++        // A continent: only what is near the followed player, and nothing
++        // while they are elsewhere. The area is kept for the combat hooks.
++        StreamArea area;
++        if (!map->GetInstanceId())
++        {
++            Player* followed = centre ? ObjectAccessor::GetPlayer(map, centre) : nullptr;
++            if (followed && followed->IsInWorld() && radius)
++                area = {followed->GetPositionX(), followed->GetPositionY(), float(radius)};
++            std::lock_guard<std::mutex> lock(streamStateMutex);
++            auto const iterator = streamSubscriptions.find(sessionKey);
++            if (iterator != streamSubscriptions.end() && iterator->second.centre == centre)
++                iterator->second.area = area;
++        }
++        if (!map->GetInstanceId() && area.radius <= 0.0f)
++            return;
++
+         std::unordered_map<ObjectGuid, StreamPlayerGroup> groupSnapshots;
+         {
+             std::lock_guard<std::mutex> lock(state->groupMutex);
+@@ -2101,7 +2187,7 @@ private:
+         for (auto const& playerReference : map->GetPlayers())
+         {
+             Player* player = playerReference.GetSource();
+-            if (!player || !player->IsInWorld())
++            if (!player || !player->IsInWorld() || !area.Contains(player))
+                 continue;
+             ObjectGuid const playerGuid = player->GetGUID();
+             groupPlayers.insert(playerGuid);
+@@ -2153,11 +2239,11 @@ private:
+                                               [&](StreamPlayer const& player) { return player.guid == entry.first; });
+                       });
+         std::vector<StreamCreature> creatures;
+-        CollectCreatures(map, *state, nowMs, creatures, paths, appearances, unitAuras, debuffs);
++        CollectCreatures(map, area, *state, nowMs, creatures, paths, appearances, unitAuras, debuffs);
+         std::vector<StreamMarker> markers;
+         bool const sendMarkers = CollectMarkers(groupIds, *state, nowMs, markers);
+         std::vector<StreamGameObject> gameObjects;
+-        CollectGameObjects(map, *state, nowMs, gameObjects);
++        CollectGameObjects(map, area, *state, nowMs, gameObjects);
+         // Forget units that have gone, so a return is sent as new.
+         auto gone = [&](auto const& entry)
+         {
+@@ -2318,7 +2404,7 @@ private:
+     // due a refresh; a unit with none is sent only as its last one goes.
+     // Adds each spawned game object with a model that appeared, changed, or is
+     // due a refresh to `objects`, and one marked gone for each that went.
+-    static void CollectGameObjects(Map* map, StreamSessionState& state, uint64 nowMs,
++    static void CollectGameObjects(Map* map, StreamArea const& area, StreamSessionState& state, uint64 nowMs,
+                                    std::vector<StreamGameObject>& objects)
+     {
+         std::vector<GameObject*> present;
+@@ -2329,7 +2415,7 @@ private:
+         std::unordered_set<uint32> seen;
+         for (GameObject* object : present)
+         {
+-            if (!object->IsInWorld() || !object->isSpawned() || !object->GetDisplayId())
++            if (!area.Contains(object) || !object->IsInWorld() || !object->isSpawned() || !object->GetDisplayId())
+                 continue;
+             GameobjectTypes const type = object->GetGoType();
+             // Spell foci are invisible markers; traps can have a model (the glow
+@@ -2645,7 +2731,7 @@ private:
+ 
+     // Adds each creature that moved, changed, or is due a refresh to
+     // `creatures`, and its path to `paths` when that changed.
+-    static void CollectCreatures(Map* map, StreamSessionState& state, uint64 nowMs,
++    static void CollectCreatures(Map* map, StreamArea const& area, StreamSessionState& state, uint64 nowMs,
+                                  std::vector<StreamCreature>& creatures, std::vector<StreamPath>& paths,
+                                  std::vector<StreamAppearance>& appearances, std::vector<StreamUnitAuras>& unitAuras,
+                                  std::vector<StreamUnitDebuffs>& debuffs)
+@@ -2658,7 +2744,7 @@ private:
+         std::unordered_set<uint32> seen;
+         for (Creature* creature : present)
+         {
+-            if (!creature->IsInWorld() || creature->IsDuringRemoveFromWorld() || creature->IsTrigger() ||
++            if (!area.Contains(creature) || !creature->IsInWorld() || creature->IsDuringRemoveFromWorld() || creature->IsTrigger() ||
+                 creature->IsCritter())
+                 continue;
+             uint32 const guid = GetStreamUnitId(creature->GetGUID());
+@@ -2832,13 +2918,17 @@ std::shared_ptr<StreamSessionState> FindCombatStream(Unit const* unit)
+     if (!streamAnySubscribed || !unit || !unit->IsInWorld())
+         return {};
+     Map* map = unit->GetMap();
+-    if (!map || !map->GetInstanceId())
++    if (!map)
+         return {};
+     uint64 const nowMs = GameTime::GetGameTimeMS().count();
+     std::lock_guard<std::mutex> lock(streamStateMutex);
+     auto const iterator = streamSubscriptions.find(GetSessionKey(map->GetId(), map->GetInstanceId()));
+     if (iterator == streamSubscriptions.end() || iterator->second.expiresAtMs <= nowMs)
+         return {};
++    // A continent: only units near the followed player.
++    StreamArea const& area = iterator->second.area;
++    if (!map->GetInstanceId() && (area.radius <= 0.0f || !area.Contains(unit)))
++        return {};
+     return iterator->second.state;
+ }
+ 

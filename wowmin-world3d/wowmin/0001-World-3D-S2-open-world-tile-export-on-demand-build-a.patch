@@ -1,0 +1,642 @@
+From 24845cf580795975abbe69d9852cb69f91d31e1f Mon Sep 17 00:00:00 2001
+From: astrangedaytoday15-dev <342675337+astrangedaytoday15-dev@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 02:44:33 -0400
+Subject: [PATCH 1/4] World 3D S2: open-world tile export, on-demand build and
+ cache
+
+- scripts/scene/export-tile.mjs: one ADT tile of a map as a scene
+  (<x>_<y>.glb + .scene.json) with the instance scene exporter unchanged;
+  tile maths (tileBounds, tileAt, tileWindow); ocean tiles marked .empty
+- scripts/export-world-tiles.mjs + npm run extract:world (--tile / --around)
+- scripts/scene/world-tile-worker.mjs + src/world-tiles.ts: tiles built in
+  a child process on first request and cached under assets/world/v1/<map>/
+  (WOWMIN_WORLD_TILE_DIR); WOWMIN_WORLD3D_TILES window size (odd 1-7, 3)
+- src/web-server.ts: GET /assets/world/<map>/<x>_<y>.glb | .scene.json
+- scripts/test-world-tiles.cjs; assets/world/ ignored
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .gitignore                          |   1 +
+ package.json                        |   1 +
+ scripts/export-world-tiles.mjs      | 118 ++++++++++++++++++++++
+ scripts/scene/export-tile.mjs       | 100 +++++++++++++++++++
+ scripts/scene/world-tile-worker.mjs |  43 ++++++++
+ scripts/test-world-tiles.cjs        |  95 ++++++++++++++++++
+ src/web-server.ts                   |  17 +++-
+ src/world-tiles.ts                  | 150 ++++++++++++++++++++++++++++
+ 8 files changed, 524 insertions(+), 1 deletion(-)
+ create mode 100644 scripts/export-world-tiles.mjs
+ create mode 100644 scripts/scene/export-tile.mjs
+ create mode 100644 scripts/scene/world-tile-worker.mjs
+ create mode 100644 scripts/test-world-tiles.cjs
+ create mode 100644 src/world-tiles.ts
+
+diff --git a/.gitignore b/.gitignore
+index 573f37b..9205426 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -45,6 +45,7 @@ assets/maps/*
+ !assets/maps/README.txt
+ assets/player-icons/
+ assets/models/
++assets/world/
+ *.blp
+ *.mpq
+ *.MPQ
+diff --git a/package.json b/package.json
+index 46f78da..941bcd0 100644
+--- a/package.json
++++ b/package.json
+@@ -12,6 +12,7 @@
+     "build:css:watch": "node scripts/build-css.js --watch",
+     "extract:maps": "node scripts/extract-map-assets.mjs",
+     "extract:scenes": "node scripts/export-scenes.mjs",
++    "extract:world": "node scripts/export-world-tiles.mjs",
+     "check:exports": "node scripts/check-exports.mjs",
+     "extract:icons": "node scripts/extract-player-icons.mjs",
+     "start": "node dist/web-server.js",
+diff --git a/scripts/export-world-tiles.mjs b/scripts/export-world-tiles.mjs
+new file mode 100644
+index 0000000..582a25d
+--- /dev/null
++++ b/scripts/export-world-tiles.mjs
+@@ -0,0 +1,118 @@
++#!/usr/bin/env node
++// Exports World 3D's open-world tile scenes ahead of time: one tile, or the
++// window of tiles around one (scripts/scene/export-tile.mjs). The web
++// service builds missing tiles on demand anyway; this pre-builds an area.
++
++import path from 'node:path';
++import { pathToFileURL } from 'node:url';
++
++import { locateDataDir, openClientData } from './client-archives.mjs';
++import { buildMapCatalog } from './map-catalog.mjs';
++import { assertNpmValueOptionsHaveValues, readNpmConfigValue } from './npm-config.mjs';
++import { exportWorldTile, tileWindow } from './scene/export-tile.mjs';
++
++const USAGE = `WoW Admin World 3D tile exporter
++
++Usage:
++  npm run extract:world -- --source /path/to/WoW --map 0 --tile 32 32
++  npm run extract:world -- --source /path/to/WoW --map 0 --around 32 32 --size 3
++
++Options:
++  --source, -s        WoW client root or its Data directory
++  --output, -o        Output directory (default: assets/world); tiles go in <output>/<map>/
++  --map, -m           Map ID (0 Eastern Kingdoms, 1 Kalimdor, 530 Outland, 571 Northrend)
++  --tile X Y          Export this ADT tile (repeatable)
++  --around X Y        Export the window of tiles centred on this tile
++  --size N            Window size for --around, an odd number (default: 3)
++  --scene-texture-max Largest scene texture edge in pixels (default: 512)
++  --help, -h          Show this message
++`;
++
++const NPM_VALUE_OPTIONS = ['source', 'output', 'map', 'size', 'scene_texture_max'];
++
++export function parseWorldTileArgs(argv) {
++  assertNpmValueOptionsHaveValues(NPM_VALUE_OPTIONS);
++  const options = {
++    source: readNpmConfigValue('source') ?? null,
++    output: readNpmConfigValue('output') ?? 'assets/world',
++    mapId: readNpmConfigValue('map') === undefined ? null : Number(readNpmConfigValue('map')),
++    tiles: [],
++    around: null,
++    size: Number(readNpmConfigValue('size') ?? 3),
++    textureMax: Number(readNpmConfigValue('scene_texture_max') ?? 512),
++    help: false,
++  };
++  for (let index = 0; index < argv.length; index += 1) {
++    const arg = argv[index];
++    const value = () => {
++      const next = argv[++index];
++      if (next === undefined) throw new Error(`${arg} needs a value.`);
++      return next;
++    };
++    switch (arg) {
++      case '--source': case '-s': options.source = value(); break;
++      case '--output': case '-o': options.output = value(); break;
++      case '--map': case '-m': options.mapId = Number(value()); break;
++      case '--tile': options.tiles.push({ x: Number(value()), y: Number(value()) }); break;
++      case '--around': options.around = { x: Number(value()), y: Number(value()) }; break;
++      case '--size': options.size = Number(value()); break;
++      case '--scene-texture-max': options.textureMax = Number(value()); break;
++      case '--help': case '-h': options.help = true; break;
++      default: throw new Error(`Unknown argument: ${arg}`);
++    }
++  }
++  if (options.help) return options;
++  if (!options.source) throw new Error('Missing required --source argument.');
++  if (!Number.isInteger(options.mapId) || options.mapId < 0) throw new Error('Pass --map <id>.');
++  if (!options.tiles.length && !options.around) throw new Error('Pass --tile X Y or --around X Y.');
++  if (options.tiles.length && options.around) throw new Error('--tile and --around are mutually exclusive.');
++  if (options.around) options.tiles = tileWindow(options.around.x, options.around.y, options.size);
++  if (!options.tiles.length || options.tiles.some(({ x, y }) => !Number.isInteger(x) || !Number.isInteger(y) || x < 0 || y < 0 || x > 63 || y > 63)) {
++    throw new Error('Tiles must be whole numbers from 0 to 63.');
++  }
++  if (!Number.isInteger(options.textureMax) || options.textureMax < 1) {
++    throw new Error(`Scene texture size must be a positive integer. Received: ${options.textureMax}`);
++  }
++  return { ...options, source: path.resolve(options.source), output: path.resolve(options.output) };
++}
++
++async function main() {
++  const options = parseWorldTileArgs(process.argv.slice(2));
++  if (options.help) {
++    console.log(USAGE);
++    return;
++  }
++  const dataDir = locateDataDir(options.source);
++  if (!dataDir) throw new Error(`No WoW client Data directory at ${options.source}.`);
++  const readFile = openClientData(dataDir, { warn: (message) => console.warn(`  ! ${message}`) });
++  const [map] = buildMapCatalog(readFile, { mapIds: [options.mapId] });
++  if (!map) throw new Error(`Map ${options.mapId} is not in Map.dbc.`);
++  const outputDir = path.join(options.output, String(options.mapId));
++
++  let written = 0;
++  for (const { x, y } of options.tiles) {
++    const started = Date.now();
++    try {
++      const { empty, stats } = await exportWorldTile({
++        mapId: options.mapId, internalName: map.internalName, readFile, outputDir, x, y, textureMax: options.textureMax,
++      });
++      if (empty) {
++        console.log(`• ${map.label} tile ${x},${y}: no terrain (open sea), marked empty`);
++      } else {
++        written += 1;
++        console.log(`• ${map.label} tile ${x},${y}: ${(stats.bytes / 1048576).toFixed(1)} MB, ${stats.wmoCount} WMO, `
++          + `${stats.doodadCount} doodads, ${((Date.now() - started) / 1000).toFixed(1)} s`);
++      }
++    } catch (error) {
++      console.warn(`  ! Skipping tile ${x},${y}: ${error instanceof Error ? error.message : error}`);
++    }
++  }
++  console.log(`\nDone. Wrote ${written} of ${options.tiles.length} tile(s) to ${outputDir}`);
++}
++
++if (process.argv[1] && pathToFileURL(path.resolve(process.argv[1])).href === import.meta.url) {
++  main().catch((error) => {
++    console.error(`✖ ${error instanceof Error ? error.message : error}`);
++    process.exitCode = 1;
++  });
++}
+diff --git a/scripts/scene/export-tile.mjs b/scripts/scene/export-tile.mjs
+new file mode 100644
+index 0000000..2a051d4
+--- /dev/null
++++ b/scripts/scene/export-tile.mjs
+@@ -0,0 +1,100 @@
++// Builds one open-world map tile's scene for World 3D: <x>_<y>.glb plus its
++// manifest <x>_<y>.scene.json, from one ADT tile of a map (a continent), with
++// the instance scene exporter (export-scene.mjs) unchanged: every other tile
++// of the map reads as missing, and the play area is the tile's own box.
++// Tiles are named by their ADT file numbers (<map>_<x>_<y>.adt): x runs with
++// server Y and y with server X, both counting down from 32 at the map centre.
++// A WMO is kept whole by the tile that places it, so a building over a tile
++// edge reaches past its box (and neighbours can place the same one).
++
++import fs from 'node:fs';
++import path from 'node:path';
++
++import { readWdt } from './placement.mjs';
++import { exportMapScene } from './export-scene.mjs';
++
++export const WORLD_TILE_SCHEMA_VERSION = 1;
++export const TILE_SIZE = 1600 / 3;
++export const TILES_PER_SIDE = 64;
++
++// The server box a tile covers.
++export function tileBounds(x, y) {
++  const maxX = (32 - y) * TILE_SIZE;
++  const maxY = (32 - x) * TILE_SIZE;
++  return { minX: maxX - TILE_SIZE, maxX, minY: maxY - TILE_SIZE, maxY };
++}
++
++// The tile a server position (x north, y west) stands on.
++export function tileAt(serverX, serverY) {
++  return { x: Math.floor(32 - serverY / TILE_SIZE), y: Math.floor(32 - serverX / TILE_SIZE) };
++}
++
++export function isTileInRange(x, y) {
++  return Number.isInteger(x) && Number.isInteger(y) && x >= 0 && y >= 0 && x < TILES_PER_SIDE && y < TILES_PER_SIDE;
++}
++
++// The size x size tiles centred on (x, y), row by row, clipped to the map's
++// grid; size is odd.
++export function tileWindow(x, y, size) {
++  if (!Number.isInteger(size) || size < 1 || size % 2 === 0) throw new Error(`Window size must be an odd number, not ${size}.`);
++  const reach = (size - 1) / 2;
++  const tiles = [];
++  for (let dy = -reach; dy <= reach; dy += 1) {
++    for (let dx = -reach; dx <= reach; dx += 1) {
++      if (isTileInRange(x + dx, y + dy)) tiles.push({ x: x + dx, y: y + dy });
++    }
++  }
++  return tiles;
++}
++
++export const tileBaseName = (x, y) => `${x}_${y}`;
++
++// A readFile that sees only one ADT tile of the map; every other file reads
++// as usual.
++export function onlyTile(readFile, internalName, x, y) {
++  const prefix = `world\\maps\\${internalName}\\${internalName}_`.toLowerCase();
++  const kept = `${prefix}${x}_${y}.adt`;
++  return (name) => {
++    const normal = name.replace(/\//g, '\\').toLowerCase();
++    if (normal.startsWith(prefix) && normal.endsWith('.adt') && normal !== kept) return null;
++    return readFile(name);
++  };
++}
++
++// Writes the tile's scene into outputDir, or an <x>_<y>.empty marker for a
++// tile the map has no ADT for (open sea), so it is not asked for again.
++// Returns { empty, manifest, stats }.
++export async function exportWorldTile({ mapId, internalName, readFile, outputDir, x, y, textureMax = 512 }) {
++  if (!isTileInRange(x, y)) throw new Error(`Tile ${x},${y} is outside the map grid.`);
++  const base = tileBaseName(x, y);
++  fs.mkdirSync(outputDir, { recursive: true });
++  const mapPath = `World\\maps\\${internalName}\\${internalName}`;
++  const wdtBuffer = readFile(`${mapPath}.wdt`);
++  if (!wdtBuffer) throw new Error(`Missing ${mapPath}.wdt`);
++  const wdt = readWdt(wdtBuffer);
++  if (wdt.wmoOnly || !wdt.tiles.some((tile) => tile.x === x && tile.y === y)) {
++    fs.writeFileSync(path.join(outputDir, `${base}.empty`), '');
++    return { empty: true, manifest: null, stats: null };
++  }
++
++  // exportMapScene writes <mapId>.glb; each tile builds in its own folder so
++  // a half-written scene never sits under a tile's name.
++  const workDir = path.join(outputDir, `.build-${base}-${process.pid}`);
++  fs.rmSync(workDir, { recursive: true, force: true });
++  fs.mkdirSync(workDir, { recursive: true });
++  try {
++    const bounds = tileBounds(x, y);
++    const { scene, stats } = await exportMapScene({
++      mapId, internalName, readFile: onlyTile(readFile, internalName, x, y), outputDir: workDir, textureMax, worldMapBounds: bounds,
++    });
++    const manifest = {
++      schemaVersion: WORLD_TILE_SCHEMA_VERSION, mapId, tile: [x, y], tileBounds: bounds, ...scene, file: `${base}.glb`,
++    };
++    fs.renameSync(path.join(workDir, scene.file), path.join(outputDir, `${base}.glb`));
++    // The manifest last: its presence means the tile is complete.
++    fs.writeFileSync(path.join(outputDir, `${base}.scene.json`), `${JSON.stringify(manifest, null, 2)}\n`);
++    return { empty: false, manifest, stats };
++  } finally {
++    fs.rmSync(workDir, { recursive: true, force: true });
++  }
++}
+diff --git a/scripts/scene/world-tile-worker.mjs b/scripts/scene/world-tile-worker.mjs
+new file mode 100644
+index 0000000..41c657f
+--- /dev/null
++++ b/scripts/scene/world-tile-worker.mjs
+@@ -0,0 +1,43 @@
++// Child process of the web server that builds World 3D's open-world tile
++// scenes (export-tile.mjs) from the WoW client's Data directory on request,
++// into the folder it is given. Messages in: { id, mapId, x, y, outputDir };
++// out: { id, ok, empty?, error? }. Client archives are opened once, on the
++// first request; tiles build one at a time, in the order asked.
++
++import { openClientData } from '../client-archives.mjs';
++import { buildMapCatalog } from '../map-catalog.mjs';
++import { exportWorldTile } from './export-tile.mjs';
++
++let readFile = null;
++const mapNames = new Map();
++
++function clientFiles() {
++  if (!readFile) {
++    const dataDir = process.env.WOWMIN_CLIENT_DATA;
++    if (!dataDir) throw new Error('WOWMIN_CLIENT_DATA is not set.');
++    readFile = openClientData(dataDir, { warn: (message) => console.warn(`[world tiles] ${message}`) });
++  }
++  return readFile;
++}
++
++function internalName(mapId) {
++  if (!mapNames.has(mapId)) {
++    const [map] = buildMapCatalog(clientFiles(), { mapIds: [mapId] });
++    if (!map) throw new Error(`Map ${mapId} is not in Map.dbc.`);
++    mapNames.set(mapId, map.internalName);
++  }
++  return mapNames.get(mapId);
++}
++
++let queue = Promise.resolve();
++
++process.on('message', ({ id, mapId, x, y, outputDir }) => {
++  queue = queue.then(async () => {
++    try {
++      const { empty } = await exportWorldTile({ mapId, internalName: internalName(mapId), readFile: clientFiles(), outputDir, x, y });
++      process.send({ id, ok: true, empty });
++    } catch (error) {
++      process.send({ id, ok: false, error: error instanceof Error ? error.message : String(error) });
++    }
++  });
++});
+diff --git a/scripts/test-world-tiles.cjs b/scripts/test-world-tiles.cjs
+new file mode 100644
+index 0000000..291df59
+--- /dev/null
++++ b/scripts/test-world-tiles.cjs
+@@ -0,0 +1,95 @@
++const assert = require('node:assert/strict');
++const path = require('node:path');
++const { test } = require('node:test');
++const { pathToFileURL } = require('node:url');
++const vm = require('node:vm');
++const esbuild = require('esbuild');
++
++// World 3D's open-world tiles: tile maths, the export window, the one-tile
++// file filter, the exporter's options, and the web service's tile paths.
++// None of these use Blizzard files.
++
++const tiles = import(pathToFileURL(path.join(__dirname, 'scene', 'export-tile.mjs')).href);
++const cli = import(pathToFileURL(path.join(__dirname, 'export-world-tiles.mjs')).href);
++
++function loadModule(relativePath) {
++  const output = esbuild.buildSync({
++    entryPoints: [path.join(__dirname, relativePath)],
++    bundle: true,
++    write: false,
++    platform: 'node',
++    format: 'cjs',
++  }).outputFiles[0].text;
++  const context = { module: { exports: {} }, require, Buffer, process, console, setTimeout, clearTimeout };
++  context.exports = context.module.exports;
++  vm.runInNewContext(output, context);
++  return context.module.exports;
++}
++
++const { parseWorldTilePath, worldWindowSize } = loadModule('../src/world-tiles.ts');
++
++test('a server position stands on the tile whose box holds it', async () => {
++  const { tileAt, tileBounds, TILE_SIZE } = await tiles;
++  // Hillsbrad bots (S97 spike): Darin on 32,32 and Morl on 33,32.
++  assert.deepEqual(tileAt(-467, -163.5), { x: 32, y: 32 });
++  assert.deepEqual(tileAt(-263.8, -656.3), { x: 33, y: 32 });
++  assert.deepEqual(tileBounds(32, 32), { minX: -TILE_SIZE, maxX: 0, minY: -TILE_SIZE, maxY: 0 });
++  for (const [x, y] of [[-467, -163.5], [-263.8, -656.3], [1676, -4315], [-8913, 554]]) {
++    const tile = tileAt(x, y);
++    const box = tileBounds(tile.x, tile.y);
++    assert.ok(x >= box.minX && x < box.maxX && y >= box.minY && y < box.maxY, `${x},${y} in tile ${tile.x},${tile.y}`);
++  }
++});
++
++test('the window is size x size tiles round the centre, clipped to the grid', async () => {
++  const { tileWindow } = await tiles;
++  assert.equal(tileWindow(32, 32, 3).length, 9);
++  assert.deepEqual(tileWindow(32, 32, 1), [{ x: 32, y: 32 }]);
++  assert.deepEqual(tileWindow(32, 32, 3)[0], { x: 31, y: 31 });
++  assert.deepEqual(tileWindow(32, 32, 3)[8], { x: 33, y: 33 });
++  assert.equal(tileWindow(0, 0, 3).length, 4);
++  assert.equal(tileWindow(63, 10, 5).length, 15);
++  assert.throws(() => tileWindow(32, 32, 4), /odd number/);
++  assert.throws(() => tileWindow(32, 32, 0), /odd number/);
++});
++
++test('the exporter sees only its own tile of the map', async () => {
++  const { onlyTile } = await tiles;
++  const asked = [];
++  const readFile = onlyTile((name) => { asked.push(name); return Buffer.from(name); }, 'Azeroth', 32, 32);
++  assert.ok(readFile('World\\maps\\Azeroth\\Azeroth_32_32.adt'));
++  assert.ok(readFile('world/maps/azeroth/azeroth_32_32.adt'));
++  assert.equal(readFile('World\\maps\\Azeroth\\Azeroth_32_33.adt'), null);
++  assert.equal(readFile('World\\maps\\Azeroth\\Azeroth_31_32.adt'), null);
++  assert.ok(readFile('World\\maps\\Azeroth\\Azeroth.wdt'));
++  assert.ok(readFile('World\\wmo\\Azeroth\\Buildings\\Farmhouse.wmo'));
++  assert.equal(asked.length, 4);
++});
++
++test('world tile export options need a source, a map, and tiles', async () => {
++  const { parseWorldTileArgs } = await cli;
++  const one = parseWorldTileArgs(['--source', '/wow', '--map', '0', '--tile', '32', '32', '--tile', '33', '32']);
++  assert.deepEqual(one.tiles, [{ x: 32, y: 32 }, { x: 33, y: 32 }]);
++  assert.equal(one.output, path.resolve('assets/world'));
++  assert.equal(parseWorldTileArgs(['--source', '/wow', '--map', '0', '--around', '32', '32']).tiles.length, 9);
++  assert.equal(parseWorldTileArgs(['--source', '/wow', '-m', '1', '--around', '40', '30', '--size', '5']).tiles.length, 25);
++  assert.throws(() => parseWorldTileArgs(['--map', '0', '--tile', '1', '1']), /--source/);
++  assert.throws(() => parseWorldTileArgs(['--source', '/wow', '--tile', '1', '1']), /--map/);
++  assert.throws(() => parseWorldTileArgs(['--source', '/wow', '--map', '0']), /--tile X Y or --around X Y/);
++  assert.throws(() => parseWorldTileArgs(['--source', '/wow', '--map', '0', '--tile', '1', '1', '--around', '1', '1']), /mutually exclusive/);
++  assert.throws(() => parseWorldTileArgs(['--source', '/wow', '--map', '0', '--tile', '64', '1']), /0 to 63/);
++  assert.throws(() => parseWorldTileArgs(['--source', '/wow', '--map', '0', '--around', '1', '1', '--size', '2']), /odd number/);
++});
++
++test('the web service maps tile URLs to tiles and reads the window size', () => {
++  assert.deepEqual(JSON.parse(JSON.stringify(parseWorldTilePath('/assets/world/0/32_32.glb'))), { mapId: 0, x: 32, y: 32, file: 'glb' });
++  assert.equal(parseWorldTilePath('/assets/world/571/10_9.scene.json').file, 'scene.json');
++  assert.equal(parseWorldTilePath('/assets/world/0/64_1.glb'), null);
++  assert.equal(parseWorldTilePath('/assets/world/0/../x.glb'), null);
++  assert.equal(parseWorldTilePath('/assets/world/0/32_32.png'), null);
++  assert.equal(worldWindowSize(undefined), 3);
++  assert.equal(worldWindowSize('5'), 5);
++  assert.equal(worldWindowSize('4'), 3);
++  assert.equal(worldWindowSize('9'), 3);
++  assert.equal(worldWindowSize('x'), 3);
++});
+diff --git a/src/web-server.ts b/src/web-server.ts
+index a44b6f3..10ba828 100644
+--- a/src/web-server.ts
++++ b/src/web-server.ts
+@@ -7,6 +7,7 @@ import { createServer, IncomingMessage, ServerResponse } from 'http';
+ import * as path from 'path';
+ import { inspectLocalLogs, readLocalLogTail } from './local-logs';
+ import { parseUnitModelPath, UnitModels } from './unit-models';
++import { parseWorldTilePath, WorldTiles } from './world-tiles';
+ import { buildContentSecurityPolicy, deriveDungeonClearUrl, normalizeDungeonClearUrl } from './dungeon-clear-config';
+ import type { DbConfig, SoapConfig } from './types/api';
+ 
+@@ -175,6 +176,11 @@ const unitModels = new UnitModels(
+   modelCacheRoot,
+   path.join(projectRoot, 'scripts', 'scene', 'unit-model-worker.mjs'),
+ );
++const worldTileRoot = path.resolve(process.env.WOWMIN_WORLD_TILE_DIR || path.join(assetsRoot, 'world'));
++const worldTiles = new WorldTiles(
++  worldTileRoot,
++  path.join(projectRoot, 'scripts', 'scene', 'world-tile-worker.mjs'),
++);
+ 
+ function serveFile(request: IncomingMessage, response: ServerResponse, filePath: string): void {
+   fs.stat(filePath, (statError, stats) => {
+@@ -185,7 +191,8 @@ function serveFile(request: IncomingMessage, response: ServerResponse, filePath:
+     // Extracted map assets (scenes run to megabytes) may be cached, but are
+     // revalidated on every use so a re-extraction shows up immediately.
+     if (filePath.startsWith(`${assetsRoot}${path.sep}`)
+-      || filePath.startsWith(`${modelCacheRoot}${path.sep}`)) {
++      || filePath.startsWith(`${modelCacheRoot}${path.sep}`)
++      || filePath.startsWith(`${worldTileRoot}${path.sep}`)) {
+       const etag = `W/"${stats.size.toString(36)}-${Math.floor(stats.mtimeMs).toString(36)}"`;
+       response.setHeader('Cache-Control', 'no-cache');
+       response.setHeader('ETag', etag);
+@@ -358,6 +365,14 @@ const server = createServer(async (request, response) => {
+     else sendJson(response, 404, { error: 'No model' });
+     return;
+   }
++  // World 3D's open-world tiles are built the same way, a tile at a time.
++  const worldTile = parseWorldTilePath(decodedPath);
++  if (worldTile) {
++    const tilePath = await worldTiles.ensure(worldTile);
++    if (tilePath) serveFile(request, response, tilePath);
++    else sendJson(response, 404, { error: 'No tile' });
++    return;
++  }
+   const filePath = resolveStaticFile(decodedPath);
+   if (!filePath) {
+     sendJson(response, 404, { error: 'Not found' });
+diff --git a/src/world-tiles.ts b/src/world-tiles.ts
+new file mode 100644
+index 0000000..0a90ac5
+--- /dev/null
++++ b/src/world-tiles.ts
+@@ -0,0 +1,150 @@
++import { fork, type ChildProcess } from 'child_process';
++import * as fs from 'fs';
++import * as path from 'path';
++
++// World 3D's open-world tile scenes (scripts/scene/export-tile.mjs), built
++// on demand from the WoW client's Data directory in a child process and
++// cached under the world tile directory: <root>/v<version>/<mapId>/<x>_<y>.glb
++// and .scene.json, or <x>_<y>.empty for a tile the map has none for. Needs
++// WOWMIN_CLIENT_DATA; without it only what is already cached is served.
++
++// A tile takes about 10 s (Hillsbrad, measured); several may queue ahead.
++const BUILD_TIMEOUT_MS = 5 * 60 * 1000;
++// Bumped when the tile exporter's output changes, so tiles are rebuilt.
++export const WORLD_TILE_CACHE_VERSION = 1;
++// A tile that could not be built is not retried for this long.
++const FAILURE_RETRY_MS = 10 * 60 * 1000;
++// Window sizes the viewer may ask for (odd, centred on the followed unit).
++export const WORLD_WINDOW_DEFAULT = 3;
++export const WORLD_WINDOW_MAX = 7;
++
++export interface WorldTileRequest {
++  mapId: number;
++  x: number;
++  y: number;
++  file: 'glb' | 'scene.json';
++}
++
++// Parses /assets/world/<mapId>/<x>_<y>.glb (or .scene.json).
++export function parseWorldTilePath(urlPath: string): WorldTileRequest | null {
++  const match = urlPath.match(/^\/assets\/world\/(\d{1,4})\/(\d{1,2})_(\d{1,2})\.(glb|scene\.json)$/);
++  if (!match) return null;
++  const [, mapId, x, y, file] = match;
++  const request = { mapId: Number(mapId), x: Number(x), y: Number(y), file: file as WorldTileRequest['file'] };
++  return request.x < 64 && request.y < 64 ? request : null;
++}
++
++// WOWMIN_WORLD3D_TILES: the window's size in tiles per side, an odd number
++// from 1 to WORLD_WINDOW_MAX; anything else falls back to the default.
++export function worldWindowSize(value: string | undefined): number {
++  const size = Number(value);
++  return Number.isInteger(size) && size >= 1 && size <= WORLD_WINDOW_MAX && size % 2 === 1 ? size : WORLD_WINDOW_DEFAULT;
++}
++
++interface PendingBuild {
++  resolve: (result: 'built' | 'empty' | 'failed') => void;
++  timer: ReturnType<typeof setTimeout>;
++}
++
++export class WorldTiles {
++  private worker: ChildProcess | null = null;
++  private nextId = 1;
++  private readonly pending = new Map<number, PendingBuild>();
++  private readonly building = new Map<string, Promise<'built' | 'empty' | 'failed'>>();
++  private readonly failedAt = new Map<string, number>();
++
++  constructor(private readonly cacheRoot: string, private readonly workerScript: string) {
++    this.removeOldVersions();
++  }
++
++  get enabled(): boolean {
++    return Boolean(process.env.WOWMIN_CLIENT_DATA);
++  }
++
++  private mapDir(mapId: number): string {
++    return path.join(this.cacheRoot, `v${WORLD_TILE_CACHE_VERSION}`, String(mapId));
++  }
++
++  pathFor(request: WorldTileRequest): string {
++    return path.join(this.mapDir(request.mapId), `${request.x}_${request.y}.${request.file}`);
++  }
++
++  private removeOldVersions(): void {
++    let entries: string[];
++    try {
++      entries = fs.readdirSync(this.cacheRoot);
++    } catch {
++      return;
++    }
++    for (const entry of entries.filter((name) => /^v\d+$/.test(name) && name !== `v${WORLD_TILE_CACHE_VERSION}`)) {
++      try {
++        fs.rmSync(path.join(this.cacheRoot, entry), { recursive: true, force: true });
++      } catch (error) {
++        console.warn(`Could not remove old world tiles in ${entry}: ${error instanceof Error ? error.message : error}`);
++      }
++    }
++  }
++
++  // Resolves to the cached file, building the tile first if needed; null for
++  // a tile with no terrain (open sea) or one that could not be built.
++  async ensure(request: WorldTileRequest): Promise<string | null> {
++    const filePath = this.pathFor(request);
++    const manifest = this.pathFor({ ...request, file: 'scene.json' });
++    const exists = (file: string) => fs.promises.access(file).then(() => true, () => false);
++    // The manifest is written last, so with it the tile is complete.
++    if (await exists(manifest)) return await exists(filePath) ? filePath : null;
++    const emptyMarker = path.join(this.mapDir(request.mapId), `${request.x}_${request.y}.empty`);
++    if (await exists(emptyMarker) || !this.enabled) return null;
++    const id = `${request.mapId}/${request.x}_${request.y}`;
++    const failedAt = this.failedAt.get(id);
++    if (failedAt !== undefined) {
++      if (Date.now() - failedAt < FAILURE_RETRY_MS) return null;
++      this.failedAt.delete(id);
++    }
++    let build = this.building.get(id);
++    if (!build) {
++      build = this.build(request).finally(() => this.building.delete(id));
++      this.building.set(id, build);
++    }
++    const result = await build;
++    if (result === 'failed') this.failedAt.set(id, Date.now());
++    return result === 'built' ? filePath : null;
++  }
++
++  private build(request: WorldTileRequest): Promise<'built' | 'empty' | 'failed'> {
++    const worker = this.ensureWorker();
++    const id = this.nextId++;
++    return new Promise((resolve) => {
++      const timer = setTimeout(() => {
++        this.pending.delete(id);
++        resolve('failed');
++      }, BUILD_TIMEOUT_MS);
++      this.pending.set(id, { resolve, timer });
++      worker.send({ id, mapId: request.mapId, x: request.x, y: request.y, outputDir: this.mapDir(request.mapId) });
++    });
++  }
++
++  private ensureWorker(): ChildProcess {
++    if (this.worker) return this.worker;
++    const worker = fork(this.workerScript, [], { stdio: ['ignore', 'inherit', 'inherit', 'ipc'] });
++    worker.on('message', (message: { id: number; ok: boolean; empty?: boolean; error?: string }) => {
++      const pending = this.pending.get(message.id);
++      if (!pending) return;
++      this.pending.delete(message.id);
++      clearTimeout(pending.timer);
++      if (!message.ok && message.error) console.warn(`World tile not built: ${message.error}`);
++      pending.resolve(!message.ok ? 'failed' : message.empty ? 'empty' : 'built');
++    });
++    worker.on('exit', (code) => {
++      if (this.worker === worker) this.worker = null;
++      if (code) console.warn(`World tile worker exited with code ${code}.`);
++      for (const [id, pending] of this.pending) {
++        clearTimeout(pending.timer);
++        pending.resolve('failed');
++        this.pending.delete(id);
++      }
++    });
++    this.worker = worker;
++    return worker;
++  }
++}

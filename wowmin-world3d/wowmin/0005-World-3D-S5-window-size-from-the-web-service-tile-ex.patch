@@ -1,0 +1,303 @@
+From 732fa616a3302884a07f5955b0f08d9066c8b27b Mon Sep 17 00:00:00 2001
+From: astrangedaytoday15-dev <342675337+astrangedaytoday15-dev@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 01:44:46 -0400
+Subject: [PATCH] World 3D S5: window size from the web service, tile export
+ into its cache, docs
+
+- The window's size comes from WOWMIN_WORLD3D_TILES on the web service
+  (odd 1-7, default 3) through /api/bootstrap instead of a constant in the
+  renderer; shown read-only in the panel's toolbar. An open window is
+  rebuilt at the new size.
+- extract:world now writes into the web service's tile cache
+  (<WOWMIN_WORLD_TILE_DIR or assets/world>/v2) by default; before, its
+  default folder was one the service never read, so pre-built tiles were
+  built again on first visit. --output still writes elsewhere.
+- README: World 3D feature, settings, Generating World 3D tiles, Live Map
+  usage step.
+- Tests: window size edges, CLI output = service cache folder and the two
+  cache versions agree.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ README.md                            | 39 ++++++++++++++++++++++++++++
+ renderer/index.html                  |  1 +
+ renderer/scripts/app.ts              | 27 +++++++++++++++----
+ renderer/scripts/types/wowmin-api.ts |  2 ++
+ renderer/styles.css                  |  6 +++++
+ scripts/export-world-tiles.mjs       | 11 ++++++--
+ scripts/test-world-tiles.cjs         | 16 +++++++++++-
+ src/web-server.ts                    |  3 ++-
+ 8 files changed, 96 insertions(+), 9 deletions(-)
+
+diff --git a/README.md b/README.md
+index 8b4f2c4..6d775eb 100644
+--- a/README.md
++++ b/README.md
+@@ -119,6 +119,22 @@ accessed from a browser.
+   at 1600x1400; `?debug` on the page URL shows frame rate, draw calls, and
+   stream rates
+ 
++### World 3D (open-world follow)
++- The Live Map's **3D** button (on a selected player) follows that player
++  through the open world in 3D: the continent's terrain, buildings, and props
++  in a window of N x N map tiles round them (`WOWMIN_WORLD3D_TILES`, an odd
++  number from 1 to 7, default 3; shown in the panel's toolbar)
++- Tiles are built from the WoW 3.3.5a client the first time they are needed
++  (about 5 to 10 seconds each, in a worker process) and cached; the window
++  moves with the player and keeps the tiles just left behind
++- Markers, nameplates, the selected bot's waypoint, and trails from the 1 s
++  telemetry; with `mod-wowmin-telemetry`'s continent stream, player models in
++  their gear and NPCs with their models, health, and combat, within a chosen
++  radius (30, 50, 100, or 250 yards) of the followed player
++- Rotate (Q/E) and zoom like Instance Watch; when the player boards a boat
++  to another continent the view follows, and when they enter an instance the
++  panel says so (watch it in Instance Watch)
++
+ ### Dungeon Clear
+ - Dedicated **Dungeon Clear** tab embeds the existing DC Test Deck from
+   `mod-dungeon-clear`
+@@ -414,6 +430,10 @@ WOWMIN_STREAM_PORT=7979
+ WOWMIN_CLIENT_DATA=/path/to/WoW/Data
+ # Optional cache location; recommended for the hardened systemd service
+ WOWMIN_MODEL_CACHE_DIR=/var/lib/wowmin/models
++# World 3D: tiles per side round the followed player (odd, 1-7; default 3)
++WOWMIN_WORLD3D_TILES=3
++# Optional World 3D tile cache location (default assets/world)
++WOWMIN_WORLD_TILE_DIR=/var/lib/wowmin/world
+ ```
+ 
+ Completed session records use readable names such as `WSG-3-Oct08-26.json` and are kept indefinitely
+@@ -560,6 +580,7 @@ when Test Deck is not available from the browser at the default
+ 7. Optionally place map image files (`0.jpg`, `1.jpg`, `530.jpg`, `571.jpg`) in `assets/maps/` for visual map backgrounds (see `assets/maps/README.txt`). The app preserves the image aspect ratio automatically.
+ 8. To generate those from a WoW 3.3.5a client, run `npm run extract:maps -- --source /path/to/WoW` or point it at an extracted `World/Minimaps` folder. The standalone `--` tells npm to forward the remaining arguments unchanged.
+ 9. Optionally extract race/gender portraits, class icons, and player-state icons with `npm run extract:icons -- --source /path/to/WoW`. If skipped, WoWMin uses emoji fallbacks.
++10. With a player selected, click **3D** to follow them in World 3D (needs `WOWMIN_CLIENT_DATA` for the tiles; see [Generating World 3D tiles](#generating-world-3d-tiles)). The radius picker sets how far round them models and NPCs are streamed; **×** returns to the map.
+ 
+ ### Instance / Battleground Watch
+ 1. Navigate to the **Instance Watch** tab (keyboard shortcut **Alt+7**). Active runtime instances, raids, battlegrounds, and arenas are discovered automatically and appear as cards in the sidebar; nothing to configure beyond a SOAP connection.
+@@ -739,6 +760,24 @@ reported separately:
+ npm run check:exports -- ./assets/instances ./instances-new
+ ```
+ 
++### Generating World 3D tiles
++
++World 3D builds each open-world tile on first use (needs `WOWMIN_CLIENT_DATA`),
++so this step is optional: it pre-builds the area round a tile, for example
++where your bots level, so a first visit does not wait for it. Tiles go into
++the web service's tile cache (`WOWMIN_WORLD_TILE_DIR`, default
++`assets/world`, in a folder per cache version); `--output` writes elsewhere.
++
++```bash
++# One tile (map 0 = Eastern Kingdoms; X Y are the client's ADT tile numbers)
++npm run extract:world -- --source "/path/to/WoW" --map 0 --tile 32 32
++
++# The 5 x 5 tiles round one tile
++npm run extract:world -- --source "/path/to/WoW" --map 0 --around 32 32 --size 5
++```
++
++A tile with no terrain (open sea) is recorded as empty and drawn as nothing.
++
+ #### Classic/TBC dungeon artwork with WDM patches
+ 
+ For proper classic/TBC dungeon floor plans rather than stitched exterior
+diff --git a/renderer/index.html b/renderer/index.html
+index 8a74836..f78ac8e 100644
+--- a/renderer/index.html
++++ b/renderer/index.html
+@@ -1147,6 +1147,7 @@ SELECT * FROM creature_template WHERE entry = 1;" spellcheck="false"></textarea>
+             <canvas id="world3d-overlay" class="world3d-layer" tabindex="0" aria-label="World 3D view: Q and E rotate, scroll zooms"></canvas>
+             <div class="world3d-toolbar">
+               <span id="world3d-title" class="world3d-title"></span>
++              <span id="world3d-window" class="world3d-window" title="Tiles drawn round the unit (WOWMIN_WORLD3D_TILES on the web service, an odd number 1-7)">3&times;3</span>
+               <button id="world3d-rotate-left-btn" class="btn btn-tiny" title="Rotate left (Q)">&#10226;</button>
+               <button id="world3d-rotate-right-btn" class="btn btn-tiny" title="Rotate right (E)">&#10227;</button>
+               <button id="world3d-zoom-out-btn" class="btn btn-tiny" title="Zoom out">&minus;</button>
+diff --git a/renderer/scripts/app.ts b/renderer/scripts/app.ts
+index 50fef2e..e18b2ab 100644
+--- a/renderer/scripts/app.ts
++++ b/renderer/scripts/app.ts
+@@ -9819,16 +9819,19 @@ void refreshSessionHistory();
+ 
+ // The open world's tiles round the unit (scripts/scene/export-tile.mjs),
+ // built by the web service on first ask, drawn by the instance scene viewer,
+-// with the Live Map's 1 s positions over them. The window is
+-// WORLD3D_TILES x WORLD3D_TILES tiles; the camera frames WORLD3D_RADIUS
+-// yards round the unit, which the window always covers.
++// with the Live Map's 1 s positions over them. The window is N x N tiles,
++// N from the web service (WOWMIN_WORLD3D_TILES, default 3); the camera
++// frames WORLD3D_RADIUS yards round the unit, which a window of 3 or more
++// always covers.
+ const $world3dPanel = $<HTMLElement>('world3d-panel');
+ const $world3dScene = $<HTMLCanvasElement>('world3d-scene');
+ const $world3dOverlay = $<HTMLCanvasElement>('world3d-overlay');
+ const $world3dTitle = $<HTMLElement>('world3d-title');
+ const $world3dStatus = $<HTMLElement>('world3d-status');
+ const $world3dTrailsBtn = $<HTMLButtonElement>('world3d-trails-btn');
+-const WORLD3D_TILES = 3;
++const $world3dWindow = $<HTMLElement>('world3d-window');
++// Until the web service says otherwise (src/world-tiles.ts worldWindowSize).
++const WORLD3D_TILES_DEFAULT = 3;
+ const WORLD3D_RADIUS_DEFAULT = 140;
+ const WORLD3D_RADIUS_MIN = 8;
+ const WORLD3D_RADIUS_MAX = 480;
+@@ -9844,7 +9847,7 @@ const WORLD3D_CONTINENTS = new Set([0, 1, 530, 571]);
+ 
+ let world3dName: string | null = null;
+ let world3dSceneView: InstanceSceneView | null | undefined;
+-const world3dFollow = new WorldFollowWindow(WORLD3D_TILES);
++let world3dFollow = new WorldFollowWindow(WORLD3D_TILES_DEFAULT);
+ const world3dTrails = new WorldTrails();
+ let world3dYaw = DEFAULT_ISO_YAW;
+ let world3dRadius = WORLD3D_RADIUS_DEFAULT;
+@@ -9924,6 +9927,20 @@ function closeWorld3dTiles(): void {
+   for (const path of world3dFollow.clear()) view?.unload(world3dTileUrl(path));
+ }
+ 
++// The window size set on the web service; shown in the panel, not editable
++// there. A window already open is rebuilt at the new size.
++function setWorld3dTiles(size: number): void {
++  if (!Number.isInteger(size) || size < 1 || size % 2 !== 1 || size === world3dFollow.size) return;
++  closeWorld3dTiles();
++  world3dFollow = new WorldFollowWindow(size);
++  if ($world3dWindow) $world3dWindow.textContent = `${size}×${size}`;
++  world3dLastDraw = 0;
++}
++
++void window.wowminAPI.app.getBootstrap()
++  .then((bootstrap) => setWorld3dTiles(bootstrap.world3dTiles))
++  .catch(() => { /* keeps the default */ });
++
+ function closeWorld3d(): void {
+   closeWorld3dTiles();
+   world3dTrails.clear();
+diff --git a/renderer/scripts/types/wowmin-api.ts b/renderer/scripts/types/wowmin-api.ts
+index 8621cfc..9fca692 100644
+--- a/renderer/scripts/types/wowmin-api.ts
++++ b/renderer/scripts/types/wowmin-api.ts
+@@ -32,6 +32,8 @@ export interface BootstrapConfig {
+   managed: boolean;
+   localLogs: boolean;
+   dungeonClearUrl: string;
++  // World 3D's window in tiles per side (WOWMIN_WORLD3D_TILES, odd 1-7).
++  world3dTiles: number;
+   connections: BackendConnectionStatus;
+ }
+ 
+diff --git a/renderer/styles.css b/renderer/styles.css
+index bc66fe8..3858790 100644
+--- a/renderer/styles.css
++++ b/renderer/styles.css
+@@ -3619,6 +3619,12 @@ tbody tr:hover { background: var(--tint-accent-05); }
+   margin-right: 6px;
+ }
+ 
++.world3d-window {
++  color: var(--text-muted);
++  font-size: 11px;
++  margin-right: 4px;
++}
++
+ .world3d-status {
+   position: absolute;
+   left: 12px;
+diff --git a/scripts/export-world-tiles.mjs b/scripts/export-world-tiles.mjs
+index 582a25d..8ee36c2 100644
+--- a/scripts/export-world-tiles.mjs
++++ b/scripts/export-world-tiles.mjs
+@@ -11,6 +11,12 @@ import { buildMapCatalog } from './map-catalog.mjs';
+ import { assertNpmValueOptionsHaveValues, readNpmConfigValue } from './npm-config.mjs';
+ import { exportWorldTile, tileWindow } from './scene/export-tile.mjs';
+ 
++// The web service reads tiles from <WOWMIN_WORLD_TILE_DIR or assets/world>/
++// v<version>/<map>/, so that is where they go unless --output says otherwise.
++// Must match WORLD_TILE_CACHE_VERSION in src/world-tiles.ts.
++export const WORLD_TILE_CACHE_VERSION = 2;
++const DEFAULT_OUTPUT = path.join(process.env.WOWMIN_WORLD_TILE_DIR || 'assets/world', `v${WORLD_TILE_CACHE_VERSION}`);
++
+ const USAGE = `WoW Admin World 3D tile exporter
+ 
+ Usage:
+@@ -19,7 +25,8 @@ Usage:
+ 
+ Options:
+   --source, -s        WoW client root or its Data directory
+-  --output, -o        Output directory (default: assets/world); tiles go in <output>/<map>/
++  --output, -o        Output directory (default: the web service's tile cache,
++                      <WOWMIN_WORLD_TILE_DIR or assets/world>/v${WORLD_TILE_CACHE_VERSION}); tiles go in <output>/<map>/
+   --map, -m           Map ID (0 Eastern Kingdoms, 1 Kalimdor, 530 Outland, 571 Northrend)
+   --tile X Y          Export this ADT tile (repeatable)
+   --around X Y        Export the window of tiles centred on this tile
+@@ -34,7 +41,7 @@ export function parseWorldTileArgs(argv) {
+   assertNpmValueOptionsHaveValues(NPM_VALUE_OPTIONS);
+   const options = {
+     source: readNpmConfigValue('source') ?? null,
+-    output: readNpmConfigValue('output') ?? 'assets/world',
++    output: readNpmConfigValue('output') ?? DEFAULT_OUTPUT,
+     mapId: readNpmConfigValue('map') === undefined ? null : Number(readNpmConfigValue('map')),
+     tiles: [],
+     around: null,
+diff --git a/scripts/test-world-tiles.cjs b/scripts/test-world-tiles.cjs
+index e6ca3ea..99d8f8e 100644
+--- a/scripts/test-world-tiles.cjs
++++ b/scripts/test-world-tiles.cjs
+@@ -70,7 +70,7 @@ test('world tile export options need a source, a map, and tiles', async () => {
+   const { parseWorldTileArgs } = await cli;
+   const one = parseWorldTileArgs(['--source', '/wow', '--map', '0', '--tile', '32', '32', '--tile', '33', '32']);
+   assert.deepEqual(one.tiles, [{ x: 32, y: 32 }, { x: 33, y: 32 }]);
+-  assert.equal(one.output, path.resolve('assets/world'));
++  assert.equal(one.mapId, 0);
+   assert.equal(parseWorldTileArgs(['--source', '/wow', '--map', '0', '--around', '32', '32']).tiles.length, 9);
+   assert.equal(parseWorldTileArgs(['--source', '/wow', '-m', '1', '--around', '40', '30', '--size', '5']).tiles.length, 25);
+   assert.throws(() => parseWorldTileArgs(['--map', '0', '--tile', '1', '1']), /--source/);
+@@ -81,6 +81,15 @@ test('world tile export options need a source, a map, and tiles', async () => {
+   assert.throws(() => parseWorldTileArgs(['--source', '/wow', '--map', '0', '--around', '1', '1', '--size', '2']), /odd number/);
+ });
+ 
++test('exported tiles land where the web service looks for them', async () => {
++  const { parseWorldTileArgs, WORLD_TILE_CACHE_VERSION } = await cli;
++  const { WORLD_TILE_CACHE_VERSION: serviceVersion } = loadModule('../src/world-tiles.ts');
++  assert.equal(WORLD_TILE_CACHE_VERSION, serviceVersion);
++  const options = parseWorldTileArgs(['--source', '/wow', '--map', '0', '--tile', '32', '32']);
++  assert.equal(options.output, path.resolve(process.env.WOWMIN_WORLD_TILE_DIR || 'assets/world', `v${serviceVersion}`));
++  assert.equal(parseWorldTileArgs(['--source', '/wow', '--map', '0', '--tile', '32', '32', '--output', 'x']).output, path.resolve('x'));
++});
++
+ test('the web service maps tile URLs to tiles and reads the window size', () => {
+   assert.deepEqual(JSON.parse(JSON.stringify(parseWorldTilePath('/assets/world/0/32_32.glb'))), { mapId: 0, x: 32, y: 32, file: 'glb' });
+   assert.equal(parseWorldTilePath('/assets/world/571/10_9.scene.json').file, 'scene.json');
+@@ -92,6 +101,11 @@ test('the web service maps tile URLs to tiles and reads the window size', () =>
+   assert.equal(worldWindowSize('4'), 3);
+   assert.equal(worldWindowSize('9'), 3);
+   assert.equal(worldWindowSize('x'), 3);
++  assert.equal(worldWindowSize('1'), 1);
++  assert.equal(worldWindowSize('7'), 7);
++  assert.equal(worldWindowSize(''), 3);
++  assert.equal(worldWindowSize('3.0'), 3);
++  assert.equal(worldWindowSize('-3'), 3);
+ });
+ 
+ test('each building or prop is drawn by one tile: the one under its origin, if that lists it', async () => {
+diff --git a/src/web-server.ts b/src/web-server.ts
+index a95e522..3e532da 100644
+--- a/src/web-server.ts
++++ b/src/web-server.ts
+@@ -7,7 +7,7 @@ import { createServer, IncomingMessage, ServerResponse } from 'http';
+ import * as path from 'path';
+ import { inspectLocalLogs, readLocalLogTail } from './local-logs';
+ import { parseUnitModelPath, UnitModels } from './unit-models';
+-import { parseWorldTilePath, WorldTiles } from './world-tiles';
++import { parseWorldTilePath, worldWindowSize, WorldTiles } from './world-tiles';
+ import { parseStreamFollow } from './telemetry-stream';
+ import { buildContentSecurityPolicy, deriveDungeonClearUrl, normalizeDungeonClearUrl } from './dungeon-clear-config';
+ import type { DbConfig, SoapConfig } from './types/api';
+@@ -300,6 +300,7 @@ const server = createServer(async (request, response) => {
+       managed,
+       localLogs: managed,
+       dungeonClearUrl: dungeonClearUrl(request),
++      world3dTiles: worldWindowSize(process.env.WOWMIN_WORLD3D_TILES),
+       connections: getBackendConnectionStatus(),
+     });
+     return;
+-- 
+2.56.0.windows.2
+

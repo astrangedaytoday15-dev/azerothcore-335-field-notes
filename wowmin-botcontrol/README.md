@@ -47,6 +47,7 @@ in section 2.
 | Every command checked on the server: bots only, an allowlist, your own group only, a rate limit, logged | **[Tested]** |
 | Two off switches: a WoWMin checkbox (no restart) and a module setting (off by default) | **[Tested]** |
 | Every sent command logged by WoWMin to `bot-commands.jsonl` | **[Tested]** |
+| **Point box**: click the ground in World 3D or Instance Watch (no tool armed) for its x y z, copied as is, as `moveto x y z` for the text box, or as `go x;y;z` to whisper a bot in game | **[Built]** |
 
 What it does **not** do: no items, gold, mail, trades, teleports, gear or
 talent changes, nothing for other players' characters or their bots, and
@@ -62,7 +63,7 @@ Tested on:
 | Core | `mod-playerbots/azerothcore-wotlk`, branch `Playerbot`, `f19a18799a35` |
 | mod-playerbots | `037c01418b5d` |
 | mod-wowmin-telemetry | `804b896` + World 3D's module patches 0001 and 0002 |
-| WoWMin | `27ed100` + World 3D's 4 patches |
+| WoWMin | `27ed100` + World 3D's 5 patches |
 | OS / tools | Windows 11, MSVC, Node 24, MySQL 8.4 |
 
 You need:
@@ -111,7 +112,8 @@ Add to your live `configs/modules/mod-wowmin-telemetry.conf` (the
 ```
 WowMinTelemetry.BotCommand.Enable = 1
 WowMinTelemetry.BotCommand.OwnerAccount = <your account id>
-# optional, the default is 60 (5-250):
+# optional, the default is 60 (5-250); raise it if long moves come back
+# "too far" (we run 250):
 WowMinTelemetry.BotCommand.MoveMaxYards = 60
 ```
 
@@ -215,6 +217,20 @@ Each send is also written to WoWMin's activity log and to
 4. **Regroup**: every bot follows you again, and the bar goes back to Leader
    mode.
 
+### 4.3 Send a bot anywhere: copy a point **[Built]**
+
+Click the ground with no group tool armed: in World 3D anywhere on the
+terrain, in Instance Watch on the floor (not on a player). A small box shows
+the point's `x y z`, already selected for Ctrl+C. Its buttons copy:
+
+- **Copy**: `x y z`, for notes or the console (`wowmin botcmd <bot> moveto x y z`);
+- **moveto**: `moveto x y z`, to paste into a bot's text box (section 4.1);
+- **go**: `go x;y;z`, to whisper a bot of yours in game; it walks there
+  with pathfinding.
+
+Esc or x closes the box; the next click replaces it. On the flat dungeon map
+the height is your character's (the module finds the ground near it).
+
 A walk through a dungeon, Leader mode: Mark nearest → the group kills the
 pack → Move to the next room → Mark nearest → ... Use Hold when you want the
 group to wait, and Squad when a bot should stand somewhere on its own (a
@@ -285,7 +301,7 @@ Rules **[Tested]**:
   strategy commands only; they have no master.
 - **Text** may hold letters, digits, spaces, `+` and `-` (plus `.` in a
   move). No `;` `\` `|` or anything else, so one line cannot chain commands.
-- **Moves:** at most `MoveMaxYards` (60) from the bot, on its map, and the
+- **Moves:** at most `MoveMaxYards` (60 by default, up to 250) from the bot, on its map, and the
   point must be within 8 yards of the ground; the command uses the ground
   height.
 - **Rate limit:** 1 command per bot per second, 30 per minute in all.
@@ -407,6 +423,14 @@ added with `.playerbots bot add <name>`); `<You>` is your character.
     Mark nearest.
 21. `bot-commands.jsonl` has a line per command, with source button, text
     or group.
+
+Not run live yet (patch 0004, point box):
+
+22. World 3D, no tool armed, click the ground: a box with x y z; Copy,
+    moveto and go each say "Copied"; paste the moveto line into a bot's
+    text box and Send -> the bot walks there. Esc closes the box.
+23. Instance Watch (3D), click the floor: the same box; click a player:
+    it closes and the player is selected.
 
 ## 9. Troubleshooting
 

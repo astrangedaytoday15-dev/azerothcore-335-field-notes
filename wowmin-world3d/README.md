@@ -28,7 +28,8 @@ checked against a stand-in data stream, not on the live server;
 | Feature | Status |
 |---|---|
 | Live Map: **3D** on the selected player opens a 3D view over the map that follows it | **[Tested]** |
-| The 3 x 3 map tiles round the unit (about 1,600 yards square), built from your own 3.3.5a client the first time they are asked for, then cached | **[Tested]** |
+| The map tiles round the unit, 3 x 3 by default (about 1,600 yards square), built from your own 3.3.5a client the first time they are asked for, then cached | **[Tested]** |
+| Window size from `WOWMIN_WORLD3D_TILES` in WoWMin's `.env` (1, 3, 5 or 7 tiles per side; restart WoWMin to change), shown in the 3D toolbar as "3x3" | **[Tested]** |
 | Tiles load and unload as the unit moves; the last row left behind stays loaded for turning back | **[Tested]** |
 | Player models in their gear, NPC and mob models, health bars, combat swings and spell effects (same model code as Instance Watch) | **[Tested]** |
 | Radius picker: models and NPCs within 30 / 50 / 100 / 250 yards of the unit (default 30; 100 is a player's own view distance) | **[Tested]** |
@@ -43,7 +44,7 @@ Tested on: WoWMin `27ed100`, mod-wowmin-telemetry `804b896`, AzerothCore
 `mod-playerbots/azerothcore-wotlk` Playerbot branch `f19a18799a35`,
 mod-playerbots `037c01418b5d`, Windows, Node 24, MSVC.
 
-**WoWMin** (4 commits, `wowmin/`):
+**WoWMin** (5 commits, `wowmin/`):
 
 ```
 git clone https://github.com/Jellypowered/wowmin
@@ -57,7 +58,15 @@ npm run build
 WoWMin needs `WOWMIN_CLIENT_DATA` (your 3.3.5a `Data` folder) to build tiles
 and models, and its console (SOAP) connection for the live stream. Tiles are
 cached under `assets/world/v2/<map>/` (or `WOWMIN_WORLD_TILE_DIR`). To build
-tiles ahead of time: `npm run extract:world -- --source <Data> --map 0 --around 32 32`.
+tiles ahead of time, run this in the WoWMin folder:
+`npm run extract:world -- --source <Data> --map 0 --around 32 32` (or `--tile 32 32`).
+Since patch 0005 it writes straight into that cache; before it, the tiles went
+to `assets/world/<map>/`, which the web service never read.
+
+```ini
+# Tiles per side round the followed unit: 1, 3, 5 or 7 (default 3)
+WOWMIN_WORLD3D_TILES=3
+```
 
 **mod-wowmin-telemetry** (`mod-wowmin-telemetry/`):
 
@@ -140,6 +149,15 @@ What we ran on the live server after installing both patches (all passed):
 8. The server runs normally while World 3D is open: no lag in game, no
    errors in the worldserver console.
 
+After patch 0005 (window size):
+
+9. Open 3D on a bot: the toolbar shows "3x3" after its name and the status
+   line counts tiles out of 9.
+10. `WOWMIN_WORLD3D_TILES=5`, restart WoWMin, open 3D again: "5x5", out of 25,
+    the outer ring fills in. Back to 3 and restart: "3x3".
+11. `npm run extract:world -- --source <Data> --map 0 --tile 35 39` in the
+    WoWMin folder ends with "Wrote 1 of 1 tile(s) to ...assets/world/v2/0".
+
 ## 6. Known limits
 
 - One followed unit at a time, one stream per continent.
@@ -148,8 +166,6 @@ What we ran on the live server after installing both patches (all passed):
 - A tile that fails to build stays blank until the unit moves far enough
   that it leaves the window and comes back.
 - No fade for underground places (Undercity): the floors above are drawn.
-- The window is fixed at 3 x 3 tiles in the viewer. `WOWMIN_WORLD3D_TILES`
-  is read by the web service but not passed to the viewer yet.
 - Tested on Windows with our revisions only (section 2).
 
 ## 7. License and credits

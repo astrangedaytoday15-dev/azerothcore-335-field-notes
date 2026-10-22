@@ -1,0 +1,315 @@
+From 06c1bd0a796eed2214574027992be40b5215270e Mon Sep 17 00:00:00 2001
+From: astrangedaytoday15-dev <342675337+astrangedaytoday15-dev@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 02:27:26 -0400
+Subject: [PATCH] Bot Control: click the ground for a copyable x y z
+
+A plain click on the ground in World 3D (no group tool armed) or in
+Instance Watch (not on a player marker) opens a small popup with the
+point's x y z, selected for Ctrl+C, and buttons that copy it as is, as
+"moveto x y z" for a bot panel's text box, or as "go x;y;z" to whisper a
+bot in game. Esc or x closes it; the next click replaces it. On the flat
+map the height is the leader's (the module finds the ground near it), as
+for the group bar's Move. Clipboard API first, then the selected-text copy.
+
+- formatPointText in bot-command-rules; the copied moveto goes back
+  through normalizeBotCommand unchanged (test).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ renderer/scripts/app.ts               |  25 +++++-
+ renderer/scripts/utils/point-popup.ts | 116 ++++++++++++++++++++++++++
+ renderer/styles.css                   |  24 ++++++
+ scripts/test-bot-command.cjs          |  11 ++-
+ src/bot-command-rules.ts              |  10 +++
+ 5 files changed, 182 insertions(+), 4 deletions(-)
+ create mode 100644 renderer/scripts/utils/point-popup.ts
+
+diff --git a/renderer/scripts/app.ts b/renderer/scripts/app.ts
+index fd61a96..e8faf26 100644
+--- a/renderer/scripts/app.ts
++++ b/renderer/scripts/app.ts
+@@ -24,6 +24,7 @@ import { formatBattlegroundOutcome } from '../../src/session-outcome';
+ import { canUseMasterCommands, findGroupBots, findGroupLeader, invertFlatProjection } from '../../src/bot-command-rules';
+ import { BotCommandPanel, type BotCommandTarget, describeBotCommandResult } from './utils/bot-command-panel';
+ import { BotGroupBar } from './utils/bot-group-bar';
++import { PointPopup } from './utils/point-popup';
+ import { AppState, createInitialState, PlayerInfo } from './types/state';
+ import type { BotCommandResult, BotCommandSettings, CreatureInfo, StreamBotDecision, StreamCreatureSample, StreamStatus } from '../../src/types/api';
+ import type { ConnectionProfile, DbConfig, SoapConfig, EntityMediaPreviewResult, LogMonitorConfig, LogMonitorInspectionResult, MapBattlegroundState, MapInstanceDeath, MapInstanceState, MapPlayerPosition, MapBotWaypoint, CharacterInventoryResult, EconomyOverview, EconomyCharacterGoldResult, EconomyAuctionRow, EconomyMarketSummaryRow, SessionIndexEntry, SessionRecord, SessionRoutePoint } from '../../src/types/api';
+@@ -9330,7 +9331,15 @@ $instanceWatchCanvas?.addEventListener('pointerup', (event) => {
+     return;
+   }
+   const marker = instanceMarkerHitAreas.find((area) => Math.hypot(area.x - x, area.y - y) <= area.radius);
+-  if (marker) focusInstancePlayer(marker.name);
++  if (marker) {
++    instancePointPopup?.hide();
++    focusInstancePlayer(marker.name);
++    return;
++  }
++  // The ground's x y z, to send a bot there.
++  const point = getInstanceGroundPoint(x, y);
++  if (point) instancePointPopup?.show(point, event.clientX - rect.left, event.clientY - rect.top);
++  else instancePointPopup?.hide();
+ });
+ 
+ // A click with the group bar's Move or Mark tool armed.
+@@ -9378,6 +9387,7 @@ for (const control of document.querySelectorAll<HTMLElement>('.instance-3d-contr
+ }
+ 
+ const instanceGroupBar = createGroupBar($<HTMLElement>('instance-bot-commands'), 'bot-group-card');
++const instancePointPopup = $instanceWatchCanvas?.parentElement ? new PointPopup($instanceWatchCanvas.parentElement) : null;
+ 
+ // Shown when the owner's character is in the watched instance.
+ function updateInstanceGroupBar(session: ActiveInstanceSession | null, live: boolean, now: number): void {
+@@ -10072,6 +10082,7 @@ let world3dStream: { key: string; stop: () => void; status: StreamStatus } | nul
+ const WORLD3D_BOT_PANEL_MS = 250;
+ const world3dBotPanel = createBotCommandPanel($world3dPanel, 'bot-cmd-world3d', 'wowmin.botCommands.world3d.collapsed');
+ const world3dGroupBar = createGroupBar($world3dPanel, 'bot-group-world3d');
++const world3dPointPopup = $world3dPanel ? new PointPopup($world3dPanel) : null;
+ let world3dBotPanelAt = 0;
+ let world3dCreatureHits: CreatureHitArea[] = [];
+ let world3dGroundView: { isoView: IsoView; width: number; height: number } | null = null;
+@@ -10105,8 +10116,8 @@ function updateWorld3dGroupBar(player: MapPlayerPosition | null, now: number): v
+ }
+ 
+ $world3dOverlay?.addEventListener('click', (event) => {
++  if (!$world3dOverlay) return;
+   const tool = world3dGroupBar.tool;
+-  if (!tool || !$world3dOverlay) return;
+   const rect = $world3dOverlay.getBoundingClientRect();
+   const x = (event.clientX - rect.left) * ($world3dOverlay.width / rect.width);
+   const y = (event.clientY - rect.top) * ($world3dOverlay.height / rect.height);
+@@ -10117,7 +10128,14 @@ $world3dOverlay?.addEventListener('click', (event) => {
+   }
+   const ground = world3dGroundView;
+   const picked = ground ? getWorld3dSceneView()?.pick(ground.isoView, ground.width, ground.height, x, y) ?? null : null;
+-  void world3dGroupBar.onGroundClick(picked ? [picked[0], picked[1], picked[2]] : null);
++  const point: [number, number, number] | null = picked ? [picked[0], picked[1], picked[2]] : null;
++  if (tool === 'move') {
++    void world3dGroupBar.onGroundClick(point);
++    return;
++  }
++  // No tool armed: the ground's x y z, to send a bot there.
++  if (point) world3dPointPopup?.show(point, event.clientX - rect.left, event.clientY - rect.top);
++  else world3dPointPopup?.hide();
+ });
+ 
+ function getWorld3dSceneView(): InstanceSceneView | null {
+@@ -10191,6 +10209,7 @@ function closeWorld3d(): void {
+   syncWorld3dStream(null);
+   world3dBotPanel.update(null);
+   world3dGroupBar.update(null);
++  world3dPointPopup?.hide();
+   if (world3dPoll) { clearInterval(world3dPoll); world3dPoll = null; }
+   if (world3dFrame !== null) { cancelAnimationFrame(world3dFrame); world3dFrame = null; }
+   if ($world3dPanel) $world3dPanel.hidden = true;
+diff --git a/renderer/scripts/utils/point-popup.ts b/renderer/scripts/utils/point-popup.ts
+new file mode 100644
+index 0000000..bcc1738
+--- /dev/null
++++ b/renderer/scripts/utils/point-popup.ts
+@@ -0,0 +1,116 @@
++import { formatPointText, type PointTextStyle } from '../../../src/bot-command-rules';
++
++// The world point under a plain click on the ground (World 3D, Instance
++// Watch): x y z to read or select, and buttons that copy it as is, as the bot
++// panel's "moveto x y z", or as "go x;y;z" for a whisper to a bot in game.
++// Esc or x closes it; the next click replaces it.
++
++const COPY_BUTTONS: ReadonlyArray<readonly [PointTextStyle, string, string]> = [
++  ['xyz', 'Copy', 'Copy "x y z"'],
++  ['moveto', 'moveto', 'Copy "moveto x y z" for a bot panel\'s text box'],
++  ['go', 'go', 'Copy "go x;y;z" to whisper a bot in game'],
++];
++
++export class PointPopup {
++  readonly root: HTMLElement;
++  private readonly text: HTMLInputElement;
++  private readonly status: HTMLElement;
++  private point: [number, number, number] | null = null;
++  private statusTimer: ReturnType<typeof setTimeout> | null = null;
++
++  constructor(private readonly container: HTMLElement) {
++    this.root = document.createElement('div');
++    this.root.className = 'point-popup';
++    this.root.hidden = true;
++    this.text = document.createElement('input');
++    this.text.className = 'point-popup-text';
++    this.text.readOnly = true;
++    this.text.setAttribute('aria-label', 'Clicked point: x y z');
++    const close = this.button('×', 'Close (Esc)');
++    close.addEventListener('click', () => this.hide());
++    const head = document.createElement('div');
++    head.className = 'point-popup-row';
++    head.append(this.text, close);
++    const buttons = document.createElement('div');
++    buttons.className = 'point-popup-row';
++    for (const [style, label, title] of COPY_BUTTONS) {
++      const button = this.button(label, title);
++      button.addEventListener('click', () => void this.copy(style));
++      buttons.append(button);
++    }
++    this.status = document.createElement('span');
++    this.status.className = 'point-popup-status';
++    buttons.append(this.status);
++    this.root.append(head, buttons);
++    // Clicks inside stay inside (the view under it would take them as a new point).
++    for (const type of ['pointerdown', 'pointerup', 'click', 'wheel'] as const) {
++      this.root.addEventListener(type, (event) => event.stopPropagation());
++    }
++    container.append(this.root);
++    document.addEventListener('keydown', (event) => {
++      if (event.key === 'Escape' && !this.root.hidden) this.hide();
++    });
++  }
++
++  get open(): boolean {
++    return !this.root.hidden;
++  }
++
++  // At (left, top) in the container's CSS pixels, kept inside it.
++  show(point: [number, number, number], left: number, top: number): void {
++    this.point = point;
++    this.text.value = formatPointText(point[0], point[1], point[2], 'xyz');
++    this.setStatus('');
++    this.root.hidden = false;
++    const width = this.root.offsetWidth;
++    const height = this.root.offsetHeight;
++    const maxLeft = Math.max(4, this.container.clientWidth - width - 4);
++    const maxTop = Math.max(4, this.container.clientHeight - height - 4);
++    this.root.style.left = `${Math.min(Math.max(4, left + 12), maxLeft)}px`;
++    this.root.style.top = `${Math.min(Math.max(4, top + 12), maxTop)}px`;
++    this.text.focus();
++    this.text.select();
++  }
++
++  hide(): void {
++    this.root.hidden = true;
++    this.point = null;
++  }
++
++  private async copy(style: PointTextStyle): Promise<void> {
++    if (!this.point) return;
++    const text = formatPointText(this.point[0], this.point[1], this.point[2], style);
++    try {
++      await navigator.clipboard.writeText(text);
++      this.setStatus('Copied');
++    } catch {
++      // No clipboard API here: copy the selected text the old way, or leave
++      // it selected for Ctrl+C.
++      this.text.value = text;
++      this.text.focus();
++      this.text.select();
++      let copied = false;
++      try {
++        copied = document.execCommand('copy');
++      } catch {
++        copied = false;
++      }
++      this.setStatus(copied ? 'Copied' : 'Ctrl+C to copy');
++    }
++  }
++
++  private setStatus(text: string): void {
++    this.status.textContent = text;
++    if (this.statusTimer) clearTimeout(this.statusTimer);
++    this.statusTimer = text ? setTimeout(() => { this.status.textContent = ''; }, 2000) : null;
++  }
++
++  private button(label: string, title: string): HTMLButtonElement {
++    const button = document.createElement('button');
++    button.type = 'button';
++    button.className = 'btn btn-tiny';
++    button.textContent = label;
++    button.title = title;
++    return button;
++  }
++}
+diff --git a/renderer/styles.css b/renderer/styles.css
+index 9402cb3..3bc1117 100644
+--- a/renderer/styles.css
++++ b/renderer/styles.css
+@@ -4278,6 +4278,30 @@ tbody tr:hover { background: var(--tint-accent-05); }
+   font-size: 12px;
+ }
+ .bot-group.hidden { display: none; }
++.point-popup {
++  position: absolute;
++  z-index: 20;
++  display: flex;
++  flex-direction: column;
++  gap: 4px;
++  padding: 6px 8px;
++  border: 1px solid var(--border);
++  border-radius: var(--radius);
++  background: rgba(8, 17, 29, 0.92);
++  font-size: 12px;
++}
++.point-popup[hidden] { display: none; }
++.point-popup-row { display: flex; align-items: center; gap: 4px; }
++.point-popup-text {
++  width: 200px;
++  padding: 2px 6px;
++  border: 1px solid var(--border);
++  border-radius: var(--radius);
++  background: var(--bg-output);
++  color: var(--text);
++  font: 12px ui-monospace, monospace;
++}
++.point-popup-status { color: var(--text-muted); margin-left: 4px; }
+ .bot-group.armed { border-color: var(--yellow); }
+ .bot-group-world3d { position: absolute; z-index: 2; right: 10px; bottom: 12px; background: rgba(8, 17, 29, 0.88); }
+ .bot-group-card { width: auto; max-width: none; margin-top: 10px; }
+diff --git a/scripts/test-bot-command.cjs b/scripts/test-bot-command.cjs
+index 85a776e..7b9252a 100644
+--- a/scripts/test-bot-command.cjs
++++ b/scripts/test-bot-command.cjs
+@@ -24,7 +24,7 @@ const {
+   BotCommandSender, botStrategyPrefix, buildBotCommandLine, canUseMasterCommands, diffBotStrategies,
+   expectedStrategyChange, normalizeBotCommand, parseBotCommandReply, parseBotName, BOT_PANEL_STRATEGIES,
+   buildBotMarkLine, findGroupBots, findGroupLeader, findNearestMarkable, invertFlatProjection, parseBotMarkReply,
+-  squadMovePoints,
++  squadMovePoints, formatPointText,
+ } = moduleValue.exports;
+ 
+ const plain = (value) => JSON.parse(JSON.stringify(value));
+@@ -228,6 +228,15 @@ test('moveto: three plain numbers, sent with two decimals (B7 module)', () => {
+   }
+ });
+ 
++test('a clicked point as text: x y z, the panel moveto, the in-game go', () => {
++  assert.equal(formatPointText(-10238.6, 1219.904, 42.2, 'xyz'), '-10238.60 1219.90 42.20');
++  assert.equal(formatPointText(-10238.6, 1219.904, 42.2, 'go'), 'go -10238.60;1219.90;42.20');
++  const moveto = formatPointText(-10238.6, 1219.904, 42.2, 'moveto');
++  assert.equal(moveto, 'moveto -10238.60 1219.90 42.20');
++  // What the popup copies, the bot panel's text box takes back unchanged.
++  assert.deepEqual(plain(normalizeBotCommand(moveto)), { kind: 'move', command: moveto });
++});
++
+ test('botmark lines and replies (B7 module)', () => {
+   assert.equal(buildBotMarkLine('Ownerchar', 'skull', { entry: 299, unitId: 805306470 }),
+     'wowmin botmark Ownerchar skull 299 805306470');
+diff --git a/src/bot-command-rules.ts b/src/bot-command-rules.ts
+index 7c7fbf7..e3e2822 100644
+--- a/src/bot-command-rules.ts
++++ b/src/bot-command-rules.ts
+@@ -68,6 +68,16 @@ export function buildMoveCommand(x: number, y: number, z: number): string {
+   return `moveto ${x.toFixed(2)} ${y.toFixed(2)} ${z.toFixed(2)}`;
+ }
+ 
++// A clicked world point as text to send a bot there: "x y z" as is, the
++// panel's "moveto x y z", or "go x;y;z" for a whisper to a bot in game.
++export type PointTextStyle = 'xyz' | 'moveto' | 'go';
++
++export function formatPointText(x: number, y: number, z: number, style: PointTextStyle): string {
++  if (style === 'moveto') return buildMoveCommand(x, y, z);
++  const parts = [x, y, z].map((value) => value.toFixed(2));
++  return style === 'go' ? `go ${parts.join(';')}` : parts.join(' ');
++}
++
+ export function buildBotCommandLine(bot: string, command: string): string {
+   return `wowmin botcmd ${bot} ${command}`;
+ }
+-- 
+2.56.0.windows.2
+

@@ -47,7 +47,7 @@ in section 2.
 | Every command checked on the server: bots only, an allowlist, your own group only, a rate limit, logged | **[Tested]** |
 | Two off switches: a WoWMin checkbox (no restart) and a module setting (off by default) | **[Tested]** |
 | Every sent command logged by WoWMin to `bot-commands.jsonl` | **[Tested]** |
-| **Point box**: click the ground in World 3D or Instance Watch (no tool armed) for its x y z, copied as is, as `moveto x y z` for the text box, or as `go x;y;z` to whisper a bot in game | **[Built]** |
+| **Point box**: click the ground in World 3D or Instance Watch (no tool armed) for its x y z, copied as is, as `moveto x y z` for the text box, or as `go x;y;z` to whisper a bot in game; the text box takes any of the three | **[Tested]** (pasting `x y z` / `go` into the text box: **[Built]**) |
 
 What it does **not** do: no items, gold, mail, trades, teleports, gear or
 talent changes, nothing for other players' characters or their bots, and
@@ -217,14 +217,15 @@ Each send is also written to WoWMin's activity log and to
 4. **Regroup**: every bot follows you again, and the bar goes back to Leader
    mode.
 
-### 4.3 Send a bot anywhere: copy a point **[Built]**
+### 4.3 Send a bot anywhere: copy a point **[Tested]**
 
 Click the ground with no group tool armed: in World 3D anywhere on the
 terrain, in Instance Watch on the floor (not on a player). A small box shows
 the point's `x y z`, already selected for Ctrl+C. Its buttons copy:
 
 - **Copy**: `x y z`, for notes or the console (`wowmin botcmd <bot> moveto x y z`);
-- **moveto**: `moveto x y z`, to paste into a bot's text box (section 4.1);
+- **moveto**: `moveto x y z`, to paste into a bot's text box (section 4.1;
+  since patch 0005 the box also takes the plain `x y z` or `go x;y;z`);
 - **go**: `go x;y;z`, to whisper a bot of yours in game; it walks there
   with pathfinding.
 
@@ -424,7 +425,8 @@ added with `.playerbots bot add <name>`); `<You>` is your character.
 21. `bot-commands.jsonl` has a line per command, with source button, text
     or group.
 
-Not run live yet (patch 0004, point box):
+Point box (patch 0004; passed live except Send after a paste, fixed by
+patch 0005, which is not run live yet):
 
 22. World 3D, no tool armed, click the ground: a box with x y z; Copy,
     moveto and go each say "Copied"; paste the moveto line into a bot's
